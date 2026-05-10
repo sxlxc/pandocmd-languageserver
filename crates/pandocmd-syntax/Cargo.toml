@@ -1,0 +1,11 @@
+[package]
+name = "pandocmd-syntax"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tree-sitter.workspace = true
+tree-sitter-pandoc-markdown.workspace = true

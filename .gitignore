@@ -1,0 +1,21 @@
+# Build output
+/target/
+/debug/
+
+# Rust tooling
+**/*.rs.bk
+*.pdb
+rustc-ice-*.txt
+**/mutants.out*/
+
+# Local editor, OS, and logs
+/.idea/
+/.vscode/
+.DS_Store
+*.log
+
+# The parser source is intentionally vendored because Cargo cannot consume the
+# upstream repository directly while its submodule URL is malformed.
+!/vendor/
+!/vendor/tree-sitter-pandoc-markdown/
+!/vendor/tree-sitter-pandoc-markdown/**
