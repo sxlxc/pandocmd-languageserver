@@ -600,34 +600,30 @@ fn citation_completion_items(
     let mut items = Vec::new();
     let mut seen = BTreeSet::new();
 
-    let mut local_ids = document
-        .analysis
-        .local_reference_ids(document.parsed.text())
-        .into_iter()
-        .collect::<Vec<_>>();
-    local_ids.sort();
-    for id in local_ids {
+    let mut local_references = document.analysis.local_references(document.parsed.text());
+    local_references.sort_by(|left, right| left.id.cmp(&right.id));
+    for reference in local_references {
         push_citation_completion_item(
             &mut items,
             &mut seen,
-            id,
-            "Local Pandoc reference",
+            reference.id,
+            &reference.detail,
             text_edit_range.clone(),
             prefix,
         );
     }
 
-    let mut citation_keys = workspace
-        .citation_keys()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    citation_keys.sort();
-    for key in citation_keys {
+    let mut citations = workspace.citation_entries().collect::<Vec<_>>();
+    citations.sort_by(|left, right| left.key.cmp(&right.key));
+    for citation in citations {
+        let detail = citation
+            .completion_detail()
+            .unwrap_or_else(|| "Bibliography citation".to_string());
         push_citation_completion_item(
             &mut items,
             &mut seen,
-            key,
-            "Bibliography citation",
+            citation.key.clone(),
+            &detail,
             text_edit_range.clone(),
             prefix,
         );
@@ -798,7 +794,7 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "@fig-plot");
-        assert_eq!(items[0].detail.as_deref(), Some("Local Pandoc reference"));
+        assert_eq!(items[0].detail.as_deref(), Some("figure"));
         assert_eq!(items[0].insert_text, None);
         match &items[0].text_edit {
             Some(CompletionTextEdit::Edit(edit)) => {
@@ -807,6 +803,68 @@ mod tests {
             }
             other => panic!("expected text edit, got {other:?}"),
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn citation_completion_uses_bibliography_author_and_year() -> Result<()> {
+        let document = test_document("See [@do]\n")?;
+        let mut workspace = WorkspaceIndex::empty();
+        workspace.add_bibliography_text(
+            "@article{doe2024,\n author = {Jane Doe and John Smith},\n year = {2024}\n}",
+        );
+        let context = citation_completion_context(&document, Position::new(0, 8)).unwrap();
+
+        let items = citation_completion_items(
+            &document,
+            &workspace,
+            Some(context.edit_range),
+            Some(context.prefix.as_str()),
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "@doe2024");
+        assert_eq!(items[0].detail.as_deref(), Some("Doe and Smith 2024"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn citation_completion_uses_fenced_div_title() -> Result<()> {
+        let document =
+            test_document("::: {#thm-main .theorem title=\"Main theorem\"}\n:::\n\nSee [@th]\n")?;
+        let workspace = WorkspaceIndex::empty();
+        let context = citation_completion_context(&document, Position::new(3, 8)).unwrap();
+
+        let items = citation_completion_items(
+            &document,
+            &workspace,
+            Some(context.edit_range),
+            Some(context.prefix.as_str()),
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "@thm-main");
+        assert_eq!(items[0].detail.as_deref(), Some("theorem: Main theorem"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn citation_completion_excludes_footnote_labels() -> Result<()> {
+        let document = test_document("[^note]: Footnote\n\nSee [@no]\n")?;
+        let workspace = WorkspaceIndex::empty();
+        let context = citation_completion_context(&document, Position::new(2, 8)).unwrap();
+
+        let items = citation_completion_items(
+            &document,
+            &workspace,
+            Some(context.edit_range),
+            Some(context.prefix.as_str()),
+        );
+
+        assert!(items.is_empty());
 
         Ok(())
     }

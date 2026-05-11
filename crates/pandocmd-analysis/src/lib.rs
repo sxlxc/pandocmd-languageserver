@@ -23,11 +23,18 @@ static HEADING_LINK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\]\(#([A-Za-z0-9_.:\-]+)\)").unwrap());
 static CITATION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(^|[\s;\[\(])(-?@)([A-Za-z0-9_:.#$%&+\-?<>~/]+)").unwrap());
-static BIB_KEY_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)@\w+\s*\{\s*([^,\s]+)").unwrap());
+static BIB_ENTRY_START_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)@\w+\s*[\{\(]\s*([^,\s]+)\s*,").unwrap());
+static BIB_YEAR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b([12][0-9]{3})[a-z]?\b").unwrap());
+static BIB_AUTHOR_AND_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\s+and\s+").unwrap());
 static FENCED_DIV_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[ \t]{0,3}(:{3,})(.*)$").unwrap());
 static BRACED_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{([^}\n]*)\}").unwrap());
+static IMAGE_ATTR_PREFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"!\[[^\]\n]*\]\([^\)\n]*\)\s*$").unwrap());
+static CODE_FENCE_ATTR_PREFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[ \t]{0,3}(`{3,}|~{3,})\s*$").unwrap());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -152,11 +159,44 @@ impl FencedDiv {
             parts.join(" ")
         }
     }
+
+    pub fn title(&self) -> Option<&str> {
+        self.attributes
+            .iter()
+            .find(|attribute| attribute.key.eq_ignore_ascii_case("title"))
+            .and_then(|attribute| attribute.value.as_deref())
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BibliographyEntry {
+    pub key: String,
+    pub authors: Option<String>,
+    pub year: Option<String>,
+}
+
+impl BibliographyEntry {
+    pub fn completion_detail(&self) -> Option<String> {
+        match (&self.authors, &self.year) {
+            (Some(authors), Some(year)) => Some(format!("{authors} {year}")),
+            (Some(authors), None) => Some(authors.clone()),
+            (None, Some(year)) => Some(year.clone()),
+            (None, None) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalReference {
+    pub id: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceIndex {
-    citation_keys: HashSet<String>,
+    citations: HashMap<String, BibliographyEntry>,
 }
 
 impl WorkspaceIndex {
@@ -185,24 +225,275 @@ impl WorkspaceIndex {
     }
 
     pub fn add_bibliography_text(&mut self, text: &str) {
-        for capture in BIB_KEY_RE.captures_iter(text) {
-            if let Some(key) = capture.get(1) {
-                self.citation_keys.insert(key.as_str().to_string());
-            }
+        for capture in BIB_ENTRY_START_RE.captures_iter(text) {
+            let Some(entry) = parse_bibliography_entry(text, &capture) else {
+                continue;
+            };
+            self.citations.insert(entry.key.clone(), entry);
         }
     }
 
     pub fn has_citation_keys(&self) -> bool {
-        !self.citation_keys.is_empty()
+        !self.citations.is_empty()
     }
 
     pub fn contains_citation_key(&self, key: &str) -> bool {
-        self.citation_keys.contains(key)
+        self.citations.contains_key(key)
+    }
+
+    pub fn citation_entry(&self, key: &str) -> Option<&BibliographyEntry> {
+        self.citations.get(key)
+    }
+
+    pub fn citation_entries(&self) -> impl Iterator<Item = &BibliographyEntry> {
+        self.citations.values()
     }
 
     pub fn citation_keys(&self) -> impl Iterator<Item = &str> {
-        self.citation_keys.iter().map(String::as_str)
+        self.citations.keys().map(String::as_str)
     }
+}
+
+fn parse_bibliography_entry(
+    text: &str,
+    capture: &regex::Captures<'_>,
+) -> Option<BibliographyEntry> {
+    let key = capture.get(1)?.as_str().trim().to_string();
+    let whole = capture.get(0)?;
+    let matched = text.get(whole.start()..whole.end())?;
+    let (open_relative, open_delimiter) = matched
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '{' | '('))?;
+    let open_offset = whole.start() + open_relative;
+    let entry_end = find_bib_entry_end(text, open_offset, open_delimiter).unwrap_or(text.len());
+    let body_end = if entry_end == text.len() {
+        entry_end
+    } else {
+        entry_end.saturating_sub(1)
+    };
+    let body = text.get(whole.end()..body_end)?;
+    let fields = parse_bib_fields(body);
+    let authors = fields
+        .get("author")
+        .or_else(|| fields.get("editor"))
+        .and_then(|value| bib_author_summary(value));
+    let year = fields
+        .get("year")
+        .or_else(|| fields.get("date"))
+        .and_then(|value| bib_year(value));
+
+    Some(BibliographyEntry { key, authors, year })
+}
+
+fn find_bib_entry_end(text: &str, open_offset: usize, open_delimiter: char) -> Option<usize> {
+    let close_delimiter = if open_delimiter == '{' { '}' } else { ')' };
+    let mut depth = 0usize;
+    let mut escaped = false;
+
+    for (relative, ch) in text.get(open_offset..)?.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == open_delimiter {
+            depth += 1;
+        } else if ch == close_delimiter {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(open_offset + relative + ch.len_utf8());
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_bib_fields(body: &str) -> HashMap<String, String> {
+    let mut fields = HashMap::new();
+    let mut cursor = 0;
+
+    while cursor < body.len() {
+        let Some(field_start) = next_bib_identifier_start(body, cursor) else {
+            break;
+        };
+        let Some((key, after_key)) = parse_bib_identifier(body, field_start) else {
+            break;
+        };
+        let mut value_start = skip_whitespace(body, after_key);
+        if !body
+            .get(value_start..)
+            .is_some_and(|rest| rest.starts_with('='))
+        {
+            cursor = next_char_offset(body, field_start).unwrap_or(body.len());
+            continue;
+        }
+        value_start += 1;
+        value_start = skip_whitespace(body, value_start);
+
+        let Some((value, after_value)) = parse_bib_field_value(body, value_start) else {
+            break;
+        };
+        fields.insert(key.to_ascii_lowercase(), clean_bib_value(value));
+        cursor = after_value;
+    }
+
+    fields
+}
+
+fn next_bib_identifier_start(input: &str, start: usize) -> Option<usize> {
+    input
+        .get(start..)?
+        .char_indices()
+        .find_map(|(index, ch)| ch.is_ascii_alphabetic().then_some(start + index))
+}
+
+fn parse_bib_identifier(input: &str, start: usize) -> Option<(&str, usize)> {
+    let mut end = start;
+    for (relative, ch) in input.get(start..)?.char_indices() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+            end = start + relative + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    (end > start).then(|| (&input[start..end], end))
+}
+
+fn parse_bib_field_value(input: &str, start: usize) -> Option<(&str, usize)> {
+    let first = input.get(start..)?.chars().next()?;
+    match first {
+        '{' => {
+            let end = find_balanced_bib_value_end(input, start, '{', '}')?;
+            Some((&input[start + 1..end - 1], end))
+        }
+        '"' => {
+            let end = find_quoted_bib_value_end(input, start)?;
+            Some((&input[start + 1..end - 1], end))
+        }
+        _ => {
+            let end = input
+                .get(start..)?
+                .char_indices()
+                .find_map(|(relative, ch)| (ch == ',').then_some(start + relative))
+                .unwrap_or(input.len());
+            Some((input[start..end].trim(), end))
+        }
+    }
+}
+
+fn find_balanced_bib_value_end(
+    input: &str,
+    open_offset: usize,
+    open_delimiter: char,
+    close_delimiter: char,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+
+    for (relative, ch) in input.get(open_offset..)?.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == open_delimiter {
+            depth += 1;
+        } else if ch == close_delimiter {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(open_offset + relative + ch.len_utf8());
+            }
+        }
+    }
+
+    None
+}
+
+fn find_quoted_bib_value_end(input: &str, quote_offset: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (relative, ch) in input.get(quote_offset + 1..)?.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            return Some(quote_offset + 1 + relative + ch.len_utf8());
+        }
+    }
+    None
+}
+
+fn skip_whitespace(input: &str, start: usize) -> usize {
+    let mut cursor = start;
+    while let Some(ch) = input.get(cursor..).and_then(|rest| rest.chars().next()) {
+        if !ch.is_whitespace() {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    cursor
+}
+
+fn next_char_offset(input: &str, offset: usize) -> Option<usize> {
+    let ch = input.get(offset..)?.chars().next()?;
+    Some(offset + ch.len_utf8())
+}
+
+fn clean_bib_value(value: &str) -> String {
+    value
+        .replace(['{', '}'], "")
+        .replace(['~', '\n', '\r', '\t'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn bib_author_summary(value: &str) -> Option<String> {
+    let authors = BIB_AUTHOR_AND_RE
+        .split(value)
+        .filter_map(bib_author_family_name)
+        .collect::<Vec<_>>();
+
+    match authors.as_slice() {
+        [] => None,
+        [author] => Some(author.clone()),
+        [first, second] => Some(format!("{first} and {second}")),
+        [first, ..] => Some(format!("{first} et al.")),
+    }
+}
+
+fn bib_author_family_name(author: &str) -> Option<String> {
+    let author = clean_bib_value(author);
+    let author = author.trim().trim_matches([',', ';']);
+    if author.is_empty() {
+        return None;
+    }
+
+    let family = author
+        .split_once(',')
+        .map(|(family, _)| family.trim())
+        .or_else(|| author.split_whitespace().last())?;
+    let family = family.trim().trim_matches([',', ';', '.']);
+    (!family.is_empty()).then(|| family.to_string())
+}
+
+fn bib_year(value: &str) -> Option<String> {
+    BIB_YEAR_RE
+        .captures(value)
+        .and_then(|captures| captures.get(1))
+        .map(|year| year.as_str().to_string())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -227,6 +518,10 @@ impl DocumentAnalysis {
 
     pub fn local_reference_ids(&self, text: &str) -> HashSet<String> {
         local_reference_ids(self, text)
+    }
+
+    pub fn local_references(&self, text: &str) -> Vec<LocalReference> {
+        local_references(self, text)
     }
 
     pub fn heading_by_anchor(&self, anchor: &str) -> Option<&Heading> {
@@ -1047,39 +1342,142 @@ fn duplicate_anchor_diagnostics(analysis: &DocumentAnalysis) -> Vec<Diagnostic> 
 }
 
 fn local_reference_ids(analysis: &DocumentAnalysis, text: &str) -> HashSet<String> {
-    let mut ids = analysis
-        .headings
-        .iter()
-        .map(|heading| heading.anchor.as_str())
-        .chain(
-            analysis
-                .fenced_divs
-                .iter()
-                .filter_map(|div| div.id.as_deref()),
-        )
-        .map(str::to_string)
-        .collect::<HashSet<_>>();
-
-    for id in braced_attribute_ids(text) {
-        ids.insert(id);
-    }
-
-    ids
+    local_references(analysis, text)
+        .into_iter()
+        .map(|reference| reference.id)
+        .collect()
 }
 
-fn braced_attribute_ids(text: &str) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    for captures in BRACED_ATTR_RE.captures_iter(text) {
-        let inner = captures.get(1).unwrap();
-        for token in tokenize_attributes(inner.as_str(), inner.start()) {
-            if let Some(id) = token.text.strip_prefix('#') {
-                if !id.is_empty() {
-                    ids.insert(id.to_string());
+fn local_references(analysis: &DocumentAnalysis, text: &str) -> Vec<LocalReference> {
+    let mut references = HashMap::<String, String>::new();
+
+    for heading in &analysis.headings {
+        insert_local_reference(&mut references, heading.anchor.clone(), "section");
+    }
+    for div in &analysis.fenced_divs {
+        if let Some(id) = &div.id {
+            insert_local_reference(
+                &mut references,
+                id.clone(),
+                fenced_div_reference_detail(div),
+            );
+        }
+    }
+    for reference in braced_attribute_references(text) {
+        insert_local_reference(&mut references, reference.id, reference.detail);
+    }
+
+    references
+        .into_iter()
+        .map(|(id, detail)| LocalReference { id, detail })
+        .collect()
+}
+
+fn insert_local_reference(
+    references: &mut HashMap<String, String>,
+    id: String,
+    detail: impl Into<String>,
+) {
+    references.entry(id).or_insert_with(|| detail.into());
+}
+
+fn fenced_div_reference_detail(div: &FencedDiv) -> String {
+    let kind = div
+        .classes
+        .first()
+        .map(String::as_str)
+        .unwrap_or("fenced div");
+
+    if let Some(title) = div.title() {
+        format!("{kind}: {title}")
+    } else {
+        kind.to_string()
+    }
+}
+
+fn braced_attribute_references(text: &str) -> Vec<LocalReference> {
+    let mut references = Vec::new();
+    for line in text.lines() {
+        for captures in BRACED_ATTR_RE.captures_iter(line) {
+            let Some(whole) = captures.get(0) else {
+                continue;
+            };
+            let inner = captures.get(1).unwrap();
+            let tokens = tokenize_attributes(inner.as_str(), inner.start());
+            let classes = tokens
+                .iter()
+                .filter_map(|token| token.text.strip_prefix('.'))
+                .filter(|class| !class.is_empty())
+                .collect::<Vec<_>>();
+
+            for token in &tokens {
+                let Some(id) = token.text.strip_prefix('#') else {
+                    continue;
+                };
+                if id.is_empty() {
+                    continue;
                 }
+                references.push(LocalReference {
+                    id: id.to_string(),
+                    detail: braced_attribute_reference_detail(line, whole.start(), id, &classes),
+                });
             }
         }
     }
-    ids
+
+    references
+}
+
+fn braced_attribute_reference_detail(
+    line: &str,
+    attr_start: usize,
+    id: &str,
+    classes: &[&str],
+) -> String {
+    if HEADING_RE.is_match(line) {
+        return "section".to_string();
+    }
+    if FENCED_DIV_RE.is_match(line) {
+        return classes
+            .first()
+            .map(|class| (*class).to_string())
+            .unwrap_or_else(|| "fenced div".to_string());
+    }
+    if let Some(detail) = reference_type_from_id(id) {
+        return detail.to_string();
+    }
+    let prefix = line.get(..attr_start).unwrap_or("").trim_end();
+    if IMAGE_ATTR_PREFIX_RE.is_match(prefix) {
+        return "figure".to_string();
+    }
+    if CODE_FENCE_ATTR_PREFIX_RE.is_match(prefix) {
+        return "code block".to_string();
+    }
+    "local Pandoc reference".to_string()
+}
+
+fn reference_type_from_id(id: &str) -> Option<&'static str> {
+    let prefix = id
+        .split(['-', ':', '_', '.'])
+        .next()
+        .unwrap_or(id)
+        .to_ascii_lowercase();
+
+    match prefix.as_str() {
+        "sec" | "section" => Some("section"),
+        "fig" | "figure" => Some("figure"),
+        "tbl" | "tab" | "table" => Some("table"),
+        "eq" | "equation" => Some("equation"),
+        "lst" | "listing" => Some("listing"),
+        "fn" | "footnote" => Some("footnote"),
+        "thm" | "theorem" => Some("theorem"),
+        "lem" | "lemma" => Some("lemma"),
+        "def" | "definition" => Some("definition"),
+        "cor" | "corollary" => Some("corollary"),
+        "prop" | "proposition" => Some("proposition"),
+        "ex" | "example" => Some("example"),
+        _ => None,
+    }
 }
 
 fn strip_inline_markup(title: &str) -> String {
@@ -1176,8 +1574,48 @@ mod tests {
     #[test]
     fn reads_bibliography_keys() {
         let mut workspace = WorkspaceIndex::empty();
-        workspace.add_bibliography_text("@article{doe2024,\n title = {T}\n}");
+        workspace.add_bibliography_text(
+            "@article{doe2024,\n author = {Jane Doe and John Smith},\n year = {2024},\n title = {T}\n}\n@book{roe2023,\n editor = {Richard Roe},\n date = {2023-05-01}\n}",
+        );
         assert!(workspace.contains_citation_key("doe2024"));
+        assert_eq!(
+            workspace
+                .citation_entry("doe2024")
+                .and_then(BibliographyEntry::completion_detail)
+                .as_deref(),
+            Some("Doe and Smith 2024")
+        );
+        assert_eq!(
+            workspace
+                .citation_entry("roe2023")
+                .and_then(BibliographyEntry::completion_detail)
+                .as_deref(),
+            Some("Roe 2023")
+        );
+    }
+
+    #[test]
+    fn classifies_local_cross_references() {
+        let text = "# Intro {#sec-custom}\n\n::: {#thm-main .theorem title=\"Main theorem\"}\nContent.\n:::\n\n![Plot](plot.png){#plot}\n\n[^note]: Footnote\n";
+        let mut parser = PandocMarkdownParser::new().unwrap();
+        let document = parser.parse(text).unwrap();
+        let analysis = DocumentAnalysis::analyze(&document, &WorkspaceIndex::empty());
+        let references = analysis
+            .local_references(document.text())
+            .into_iter()
+            .map(|reference| (reference.id, reference.detail))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            references.get("sec-custom").map(String::as_str),
+            Some("section")
+        );
+        assert_eq!(
+            references.get("thm-main").map(String::as_str),
+            Some("theorem: Main theorem")
+        );
+        assert_eq!(references.get("plot").map(String::as_str), Some("figure"));
+        assert!(!references.contains_key("note"));
     }
 
     #[test]
@@ -1202,6 +1640,21 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message == "unresolved citation `@missing`"));
+    }
+
+    #[test]
+    fn footnote_definitions_do_not_resolve_citations() {
+        let text = "[^note]: Footnote\n\nSee [@note].\n";
+        let mut workspace = WorkspaceIndex::empty();
+        workspace.add_bibliography_text("@article{real,\n title = {T}\n}");
+        let mut parser = PandocMarkdownParser::new().unwrap();
+        let document = parser.parse(text).unwrap();
+        let analysis = DocumentAnalysis::analyze(&document, &workspace);
+
+        assert!(analysis
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "unresolved citation `@note`"));
     }
 
     #[test]
