@@ -2,6 +2,10 @@
 
 See [docs][docs], [missing][nope], and [Intro](#intro).
 
+::: {#panel .note role="region"}
+This is a Pandoc fenced div.
+:::
+
 Use a footnote.[^note]
 
 [@doe2024]

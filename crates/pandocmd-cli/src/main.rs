@@ -33,13 +33,30 @@ fn main() -> Result<()> {
         Command::Symbols { file } => {
             let document = parse_file(&file)?;
             let analysis = DocumentAnalysis::analyze(&document, &WorkspaceIndex::empty());
-            for heading in analysis.headings {
-                println!(
-                    "{} {} #{}",
-                    "#".repeat(heading.level as usize),
-                    heading.title,
-                    heading.anchor
-                );
+            let mut symbols = analysis
+                .headings
+                .iter()
+                .map(|heading| {
+                    (
+                        heading.range.start,
+                        format!(
+                            "{} {} #{}",
+                            "#".repeat(heading.level as usize),
+                            heading.title,
+                            heading.anchor
+                        ),
+                    )
+                })
+                .chain(
+                    analysis
+                        .fenced_divs
+                        .iter()
+                        .map(|div| (div.range.start, format!("::: {}", div.detail()))),
+                )
+                .collect::<Vec<_>>();
+            symbols.sort_by_key(|(start, _)| *start);
+            for (_, symbol) in symbols {
+                println!("{symbol}");
             }
         }
         Command::Diagnose { file } => {

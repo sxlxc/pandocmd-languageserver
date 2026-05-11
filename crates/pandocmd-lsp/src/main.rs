@@ -289,17 +289,51 @@ impl Server {
             }
         }
 
+        #[allow(deprecated)]
+        fn div_symbol(
+            document: &OpenDocument,
+            div: &pandocmd_analysis::FencedDiv,
+        ) -> DocumentSymbol {
+            DocumentSymbol {
+                name: div.label(),
+                detail: Some(div.detail()),
+                kind: SymbolKind::OBJECT,
+                tags: None,
+                deprecated: None,
+                range: to_lsp_range(
+                    document.parsed.text(),
+                    document.parsed.line_index(),
+                    div.range,
+                ),
+                selection_range: to_lsp_range(
+                    document.parsed.text(),
+                    document.parsed.line_index(),
+                    div.selection_range,
+                ),
+                children: None,
+            }
+        }
+
         let params: DocumentSymbolParams = serde_json::from_value(params)?;
         let Some(document) = self.documents.get(&params.text_document.uri) else {
             return Ok(None);
         };
 
-        let symbols = document
+        let mut symbols = document
             .analysis
             .headings
             .iter()
-            .map(|heading| heading_symbol(document, heading))
-            .collect();
+            .map(|heading| (heading.range.start, heading_symbol(document, heading)))
+            .chain(
+                document
+                    .analysis
+                    .fenced_divs
+                    .iter()
+                    .map(|div| (div.range.start, div_symbol(document, div))),
+            )
+            .collect::<Vec<_>>();
+        symbols.sort_by_key(|(start, _)| *start);
+        let symbols = symbols.into_iter().map(|(_, symbol)| symbol).collect();
 
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
@@ -314,6 +348,7 @@ impl Server {
 
         let target = match symbol {
             SymbolAtOffset::Heading(heading) => Some(heading.selection_range),
+            SymbolAtOffset::FencedDiv(div) => Some(div.id_range.unwrap_or(div.selection_range)),
             SymbolAtOffset::ReferenceDefinition(definition) => Some(definition.label_range),
             SymbolAtOffset::FootnoteDefinition(definition) => Some(definition.label_range),
             SymbolAtOffset::ReferenceLink(link) => document
@@ -324,10 +359,9 @@ impl Server {
                 .analysis
                 .footnote_definition(&reference.label)
                 .map(|definition| definition.label_range),
-            SymbolAtOffset::HeadingLink(link) => document
-                .analysis
-                .heading_by_anchor(&link.anchor)
-                .map(|heading| heading.selection_range),
+            SymbolAtOffset::HeadingLink(link) => {
+                document.analysis.anchor_target_range(&link.anchor)
+            }
             SymbolAtOffset::Citation(_) => None,
         };
 
@@ -363,6 +397,11 @@ impl Server {
             SymbolAtOffset::Heading(heading) => document
                 .analysis
                 .heading_link_ranges_for_anchor(&heading.anchor),
+            SymbolAtOffset::FencedDiv(div) => div
+                .id
+                .as_deref()
+                .map(|id| document.analysis.heading_link_ranges_for_anchor(id))
+                .unwrap_or_else(|| vec![div.selection_range]),
             SymbolAtOffset::HeadingLink(link) => document
                 .analysis
                 .heading_link_ranges_for_anchor(&link.anchor),
@@ -399,6 +438,10 @@ impl Server {
             SymbolAtOffset::Heading(heading) => (
                 format!("Heading anchor: `#{}`", heading.anchor),
                 heading.selection_range,
+            ),
+            SymbolAtOffset::FencedDiv(div) => (
+                format!("Pandoc fenced div: `{}`", div.detail()),
+                div.selection_range,
             ),
             SymbolAtOffset::ReferenceDefinition(definition) => (
                 format!("Reference target: `{}`", definition.target),
@@ -460,6 +503,17 @@ impl Server {
                 insert_text: Some(format!("#{}", heading.anchor)),
                 ..CompletionItem::default()
             });
+        }
+        for div in &document.analysis.fenced_divs {
+            if let Some(id) = &div.id {
+                items.push(CompletionItem {
+                    label: format!("#{id}"),
+                    kind: Some(CompletionItemKind::REFERENCE),
+                    detail: Some(div.detail()),
+                    insert_text: Some(format!("#{id}")),
+                    ..CompletionItem::default()
+                });
+            }
         }
         for definition in &document.analysis.reference_definitions {
             items.push(CompletionItem {

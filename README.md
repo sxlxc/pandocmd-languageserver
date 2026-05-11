@@ -4,7 +4,7 @@
 
 The server uses `tree-sitter-pandoc-markdown` for syntax parsing and adds a
 document model for common writing workflows: headings, links, reference
-definitions, footnotes, citations, hovers, completion, navigation, and
+definitions, footnotes, citations, fenced divs, hovers, completion, navigation, and
 diagnostics.
 
 The generated grammar source is vendored under `vendor/tree-sitter-pandoc-markdown`
