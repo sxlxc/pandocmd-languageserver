@@ -7,18 +7,18 @@ use lsp_types::request::{
     Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, References, Request as _,
 };
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse,
+    CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse, CompletionTextEdit,
     Diagnostic as LspDiagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbol, DocumentSymbolParams,
     DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
     HoverParams, InitializeParams, Location, MarkedString, NumberOrString, OneOf, Position,
     PublishDiagnosticsParams, Range, ReferenceParams, ServerCapabilities, SymbolKind,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
 };
 use pandocmd_analysis::{Diagnostic, DocumentAnalysis, Severity, SymbolAtOffset, WorkspaceIndex};
 use pandocmd_pandoc::PandocValidator;
 use pandocmd_syntax::{LineIndex, PandocMarkdownParser, ParsedDocument, TextPosition, TextRange};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use tracing::{error, info};
 
 fn main() -> Result<()> {
@@ -50,12 +50,7 @@ fn server_capabilities() -> ServerCapabilities {
         hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
             resolve_provider: Some(false),
-            trigger_characters: Some(vec![
-                "[".to_string(),
-                "#".to_string(),
-                "^".to_string(),
-                "@".to_string(),
-            ]),
+            trigger_characters: Some(vec!["@".to_string()]),
             ..CompletionOptions::default()
         }),
         ..ServerCapabilities::default()
@@ -71,7 +66,16 @@ struct Server {
 
 impl Server {
     fn new(params: InitializeParams) -> Result<Self> {
-        let root = params.root_uri.and_then(|uri| uri.to_file_path().ok());
+        let root = params
+            .root_uri
+            .and_then(|uri| uri.to_file_path().ok())
+            .or_else(|| {
+                params.workspace_folders.and_then(|folders| {
+                    folders
+                        .into_iter()
+                        .find_map(|folder| folder.uri.to_file_path().ok())
+                })
+            });
         let workspace = root
             .as_deref()
             .map(WorkspaceIndex::from_root)
@@ -490,58 +494,21 @@ impl Server {
     fn completion(&self, params: serde_json::Value) -> Result<Option<CompletionResponse>> {
         let params: lsp_types::CompletionParams = serde_json::from_value(params)?;
         let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
         let Some(document) = self.documents.get(&uri) else {
             return Ok(None);
         };
 
-        let mut items = Vec::new();
-        for heading in &document.analysis.headings {
-            items.push(CompletionItem {
-                label: format!("#{}", heading.anchor),
-                kind: Some(CompletionItemKind::REFERENCE),
-                detail: Some(heading.title.clone()),
-                insert_text: Some(format!("#{}", heading.anchor)),
-                ..CompletionItem::default()
-            });
-        }
-        for div in &document.analysis.fenced_divs {
-            if let Some(id) = &div.id {
-                items.push(CompletionItem {
-                    label: format!("#{id}"),
-                    kind: Some(CompletionItemKind::REFERENCE),
-                    detail: Some(div.detail()),
-                    insert_text: Some(format!("#{id}")),
-                    ..CompletionItem::default()
-                });
-            }
-        }
-        for definition in &document.analysis.reference_definitions {
-            items.push(CompletionItem {
-                label: definition.label.clone(),
-                kind: Some(CompletionItemKind::REFERENCE),
-                detail: Some(definition.target.clone()),
-                insert_text: Some(definition.label.clone()),
-                ..CompletionItem::default()
-            });
-        }
-        for definition in &document.analysis.footnote_definitions {
-            items.push(CompletionItem {
-                label: format!("^{}", definition.label),
-                kind: Some(CompletionItemKind::REFERENCE),
-                insert_text: Some(format!("^{}", definition.label)),
-                ..CompletionItem::default()
-            });
-        }
-        for key in self.workspace.citation_keys() {
-            items.push(CompletionItem {
-                label: format!("@{key}"),
-                kind: Some(CompletionItemKind::REFERENCE),
-                insert_text: Some(format!("@{key}")),
-                ..CompletionItem::default()
-            });
+        if let Some(context) = citation_completion_context(document, position) {
+            return Ok(Some(CompletionResponse::Array(citation_completion_items(
+                document,
+                &self.workspace,
+                Some(context.edit_range),
+                Some(context.prefix.as_str()),
+            ))));
         }
 
-        Ok(Some(CompletionResponse::Array(items)))
+        Ok(None)
     }
 
     fn symbol_at_lsp_position(
@@ -557,6 +524,152 @@ impl Server {
         let symbol = document.analysis.symbol_at(offset)?;
         Some((document, symbol))
     }
+}
+
+struct CitationCompletionContext {
+    edit_range: Range,
+    prefix: String,
+}
+
+fn citation_completion_context(
+    document: &OpenDocument,
+    position: Position,
+) -> Option<CitationCompletionContext> {
+    let text = document.parsed.text();
+    let offset = document
+        .parsed
+        .line_index()
+        .position_to_offset(text, TextPosition::new(position.line, position.character));
+    let start = citation_completion_start(text, offset)?;
+    let prefix = text.get(start + 1..offset)?.to_string();
+
+    Some(CitationCompletionContext {
+        edit_range: to_lsp_range(
+            text,
+            document.parsed.line_index(),
+            TextRange::new(start, offset),
+        ),
+        prefix,
+    })
+}
+
+fn citation_completion_start(text: &str, offset: usize) -> Option<usize> {
+    let mut start = offset;
+    while let Some((idx, ch)) = previous_char(text, start) {
+        if is_citation_key_char(ch) {
+            start = idx;
+        } else {
+            break;
+        }
+    }
+
+    let (at_idx, ch) = previous_char(text, start)?;
+    if ch == '@' && can_start_citation(text, at_idx) {
+        Some(at_idx)
+    } else {
+        None
+    }
+}
+
+fn previous_char(text: &str, offset: usize) -> Option<(usize, char)> {
+    text.get(..offset)?.char_indices().next_back()
+}
+
+fn can_start_citation(text: &str, at_offset: usize) -> bool {
+    match previous_char(text, at_offset) {
+        Some((_, '[')) => true,
+        Some((dash_offset, '-')) => matches!(previous_char(text, dash_offset), Some((_, '['))),
+        _ => false,
+    }
+}
+
+fn is_citation_key_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            '_' | ':' | '.' | '#' | '$' | '%' | '&' | '+' | '-' | '?' | '<' | '>' | '~' | '/'
+        )
+}
+
+fn citation_completion_items(
+    document: &OpenDocument,
+    workspace: &WorkspaceIndex,
+    text_edit_range: Option<Range>,
+    prefix: Option<&str>,
+) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    let mut local_ids = document
+        .analysis
+        .local_reference_ids(document.parsed.text())
+        .into_iter()
+        .collect::<Vec<_>>();
+    local_ids.sort();
+    for id in local_ids {
+        push_citation_completion_item(
+            &mut items,
+            &mut seen,
+            id,
+            "Local Pandoc reference",
+            text_edit_range.clone(),
+            prefix,
+        );
+    }
+
+    let mut citation_keys = workspace
+        .citation_keys()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    citation_keys.sort();
+    for key in citation_keys {
+        push_citation_completion_item(
+            &mut items,
+            &mut seen,
+            key,
+            "Bibliography citation",
+            text_edit_range.clone(),
+            prefix,
+        );
+    }
+
+    items
+}
+
+fn push_citation_completion_item(
+    items: &mut Vec<CompletionItem>,
+    seen: &mut BTreeSet<String>,
+    key: String,
+    detail: &str,
+    text_edit_range: Option<Range>,
+    prefix: Option<&str>,
+) {
+    if prefix.is_some_and(|prefix| !key.starts_with(prefix)) || !seen.insert(key.clone()) {
+        return;
+    }
+
+    let label = format!("@{key}");
+    let text_edit = text_edit_range.map(|range| {
+        CompletionTextEdit::Edit(TextEdit {
+            range,
+            new_text: label.clone(),
+        })
+    });
+    let insert_text = if text_edit.is_some() {
+        None
+    } else {
+        Some(label.clone())
+    };
+
+    items.push(CompletionItem {
+        label: label.clone(),
+        kind: Some(CompletionItemKind::REFERENCE),
+        detail: Some(detail.to_string()),
+        filter_text: Some(label),
+        insert_text,
+        text_edit,
+        ..CompletionItem::default()
+    });
 }
 
 struct OpenDocument {
@@ -660,4 +773,77 @@ fn to_lsp_range(text: &str, line_index: &LineIndex, range: TextRange) -> Range {
         Position::new(start.line, start.character),
         Position::new(end.line, end.character),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn citation_completion_uses_local_cross_reference_ids() -> Result<()> {
+        let document = test_document("![Plot](plot.png){#fig-plot}\n\nSee [@fi]\n")?;
+        let workspace = WorkspaceIndex::empty();
+        let context = citation_completion_context(&document, Position::new(2, 8)).unwrap();
+        let expected_range = Range::new(Position::new(2, 5), Position::new(2, 8));
+
+        assert_eq!(context.prefix, "fi");
+        assert_eq!(context.edit_range, expected_range);
+
+        let items = citation_completion_items(
+            &document,
+            &workspace,
+            Some(context.edit_range),
+            Some(context.prefix.as_str()),
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "@fig-plot");
+        assert_eq!(items[0].detail.as_deref(), Some("Local Pandoc reference"));
+        assert_eq!(items[0].insert_text, None);
+        match &items[0].text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => {
+                assert_eq!(edit.range, expected_range);
+                assert_eq!(edit.new_text, "@fig-plot");
+            }
+            other => panic!("expected text edit, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn citation_completion_context_only_accepts_bracketed_citations() {
+        assert_eq!(
+            citation_completion_start("email@example", "email@example".len()),
+            None
+        );
+        assert_eq!(
+            citation_completion_start("See @fig", "See @fig".len()),
+            None
+        );
+        assert_eq!(
+            citation_completion_start("See -@fig", "See -@fig".len()),
+            None
+        );
+        assert_eq!(
+            citation_completion_start("See [@fig", "See [@fig".len()),
+            Some(5)
+        );
+        assert_eq!(
+            citation_completion_start("See [-@fig", "See [-@fig".len()),
+            Some(6)
+        );
+    }
+
+    fn test_document(text: &str) -> Result<OpenDocument> {
+        let mut parser = PandocMarkdownParser::new()?;
+        let parsed = parser.parse(text.to_string())?;
+        let analysis = DocumentAnalysis::analyze(&parsed, &WorkspaceIndex::empty());
+
+        Ok(OpenDocument {
+            version: 0,
+            parsed,
+            analysis,
+        })
+    }
 }

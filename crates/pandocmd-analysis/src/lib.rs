@@ -27,6 +27,7 @@ static BIB_KEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)@\w+\s*\{\s*([^,\s]+)").unwrap());
 static FENCED_DIV_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[ \t]{0,3}(:{3,})(.*)$").unwrap());
+static BRACED_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{([^}\n]*)\}").unwrap());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -222,6 +223,10 @@ impl DocumentAnalysis {
         let mut analysis = scan_document(document.text());
         analysis.add_diagnostics(document, workspace);
         analysis
+    }
+
+    pub fn local_reference_ids(&self, text: &str) -> HashSet<String> {
+        local_reference_ids(self, text)
     }
 
     pub fn heading_by_anchor(&self, anchor: &str) -> Option<&Heading> {
@@ -451,9 +456,12 @@ impl DocumentAnalysis {
             }
         }
 
+        let local_refs = self.local_reference_ids(document.text());
         if workspace.has_citation_keys() {
             for citation in &self.citations {
-                if !workspace.contains_citation_key(&citation.key) {
+                if !workspace.contains_citation_key(&citation.key)
+                    && !local_refs.contains(&citation.key)
+                {
                     self.diagnostics.push(Diagnostic {
                         range: citation.key_range,
                         severity: Severity::Warning,
@@ -1038,6 +1046,42 @@ fn duplicate_anchor_diagnostics(analysis: &DocumentAnalysis) -> Vec<Diagnostic> 
     diagnostics
 }
 
+fn local_reference_ids(analysis: &DocumentAnalysis, text: &str) -> HashSet<String> {
+    let mut ids = analysis
+        .headings
+        .iter()
+        .map(|heading| heading.anchor.as_str())
+        .chain(
+            analysis
+                .fenced_divs
+                .iter()
+                .filter_map(|div| div.id.as_deref()),
+        )
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+
+    for id in braced_attribute_ids(text) {
+        ids.insert(id);
+    }
+
+    ids
+}
+
+fn braced_attribute_ids(text: &str) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for captures in BRACED_ATTR_RE.captures_iter(text) {
+        let inner = captures.get(1).unwrap();
+        for token in tokenize_attributes(inner.as_str(), inner.start()) {
+            if let Some(id) = token.text.strip_prefix('#') {
+                if !id.is_empty() {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
+    }
+    ids
+}
+
 fn strip_inline_markup(title: &str) -> String {
     title
         .replace(['`', '*', '_'], "")
@@ -1134,6 +1178,30 @@ mod tests {
         let mut workspace = WorkspaceIndex::empty();
         workspace.add_bibliography_text("@article{doe2024,\n title = {T}\n}");
         assert!(workspace.contains_citation_key("doe2024"));
+    }
+
+    #[test]
+    fn treats_pandoc_at_references_to_local_labels_as_resolved() {
+        let text = "# Intro {#sec-intro}\n\n::: {#panel .note}\nContent.\n:::\n\n```{#lst-demo .rust}\nfn main() {}\n```\n\n![Plot](plot.png){#fig-plot}\n\n[Term]{#span-term}\n\nSee [@sec-intro], [@panel], [@lst-demo], [@fig-plot], [@span-term], and [@missing].\n";
+        let mut workspace = WorkspaceIndex::empty();
+        workspace.add_bibliography_text("@article{doe2024,\n title = {T}\n}");
+        let mut parser = PandocMarkdownParser::new().unwrap();
+        let document = parser.parse(text).unwrap();
+        let analysis = DocumentAnalysis::analyze(&document, &workspace);
+
+        assert!(analysis
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "unresolved-citation")
+            .all(|diagnostic| !diagnostic.message.contains("@sec-intro")
+                && !diagnostic.message.contains("@panel")
+                && !diagnostic.message.contains("@lst-demo")
+                && !diagnostic.message.contains("@fig-plot")
+                && !diagnostic.message.contains("@span-term")));
+        assert!(analysis
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "unresolved citation `@missing`"));
     }
 
     #[test]
