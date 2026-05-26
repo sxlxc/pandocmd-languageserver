@@ -17,6 +17,30 @@ resolve when used directly as a git dependency.
 cargo build
 ```
 
+## Release
+
+GitHub release assets are built by `.github/workflows/release.yml` when a
+version tag is pushed.
+
+```bash
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+The workflow publishes these assets:
+
+- `pandocmd-lsp-aarch64-apple-darwin.tar.gz`
+- `pandocmd-lsp-x86_64-apple-darwin.tar.gz`
+- `pandocmd-lsp-aarch64-unknown-linux-gnu.tar.gz`
+- `pandocmd-lsp-x86_64-unknown-linux-gnu.tar.gz`
+- `pandocmd-lsp-aarch64-pc-windows-msvc.zip`
+- `pandocmd-lsp-x86_64-pc-windows-msvc.zip`
+- `SHA256SUMS`
+
+Update the crate versions before tagging a release.
+To rebuild assets for an existing tag, run the `Release` workflow manually and
+enter the tag name.
+
 ## Run the language server
 
 ```bash

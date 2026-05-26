@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  BIN_NAME: pandocmd-lsp
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            bin_suffix: ""
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            bin_suffix: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            bin_suffix: ""
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            bin_suffix: ""
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+            bin_suffix: ".exe"
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            bin_suffix: ".exe"
+
+    steps:
+      - name: Checkout tag
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Checkout pushed ref
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build language server
+        shell: bash
+        run: cargo build --locked --release -p "${BIN_NAME}" --target "${{ matrix.target }}"
+
+      - name: Package language server
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_name="${BIN_NAME}-${{ matrix.target }}"
+          staging_dir="dist/${package_name}"
+          mkdir -p "${staging_dir}"
+
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.bin_suffix }}" "${staging_dir}/"
+          cp README.md "${staging_dir}/"
+          if [ -f LICENSE ]; then
+            cp LICENSE "${staging_dir}/"
+          fi
+
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd dist && 7z a "${package_name}.zip" "./${package_name}")
+          else
+            tar -C dist -czf "dist/${package_name}.tar.gz" "${package_name}"
+          fi
+
+      - name: Upload packaged asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: dist/${{ env.BIN_NAME }}-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" dist/* --clobber
+          else
+            gh release create "${TAG_NAME}" dist/* --verify-tag --title "${TAG_NAME}" --generate-notes
+          fi
