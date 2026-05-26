@@ -7,9 +7,14 @@ document model for common writing workflows: headings, links, reference
 definitions, footnotes, citations, fenced divs, hovers, completion, navigation, and
 diagnostics.
 
-The generated grammar source is vendored under `vendor/tree-sitter-pandoc-markdown`
-because the upstream repository currently has a submodule URL that Cargo cannot
-resolve when used directly as a git dependency.
+The generated grammar source is modified from
+[`jmbuhr/tree-sitter-pandoc-markdown`](https://github.com/jmbuhr/tree-sitter-pandoc-markdown)
+under `vendor/tree-sitter-pandoc-markdown`. The upstream project is licensed
+under the MIT License, Copyright (c) 2024 Jannik Buhr, and its license text is
+retained at `vendor/tree-sitter-pandoc-markdown/LICENSE`.
+
+The grammar is vendored because the upstream repository currently has a
+submodule URL that Cargo cannot resolve when used directly as a git dependency.
 
 ## Build
 
