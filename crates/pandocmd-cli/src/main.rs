@@ -61,10 +61,11 @@ fn main() -> Result<()> {
         }
         Command::Diagnose { file } => {
             let document = parse_file(&file)?;
-            let workspace = file
+            let base_workspace = file
                 .parent()
                 .map(WorkspaceIndex::from_root)
                 .unwrap_or_else(WorkspaceIndex::empty);
+            let workspace = base_workspace.for_document(Some(&file), document.text());
             let analysis = DocumentAnalysis::analyze(&document, &workspace);
             for diagnostic in analysis.diagnostics {
                 let (start, _) = document

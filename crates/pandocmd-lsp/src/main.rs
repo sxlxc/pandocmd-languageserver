@@ -4,18 +4,24 @@ use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, References, Request as _,
+    Completion, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest,
+    GotoDefinition, HoverRequest, References, Request as _,
 };
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse, CompletionTextEdit,
     Diagnostic as LspDiagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, InitializeParams, Location, MarkedString, NumberOrString, OneOf, Position,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentHighlight,
+    DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    InitializeParams, Location, MarkupContent, MarkupKind, NumberOrString, OneOf, Position,
     PublishDiagnosticsParams, Range, ReferenceParams, ServerCapabilities, SymbolKind,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
 };
-use pandocmd_analysis::{Diagnostic, DocumentAnalysis, Severity, SymbolAtOffset, WorkspaceIndex};
+use pandocmd_analysis::{
+    BibliographyEntry, Citation, Diagnostic, DocumentAnalysis, FencedDiv, HeadingLink, Severity,
+    SymbolAtOffset, WorkspaceIndex,
+};
 use pandocmd_pandoc::PandocValidator;
 use pandocmd_syntax::{LineIndex, PandocMarkdownParser, ParsedDocument, TextPosition, TextRange};
 use std::collections::{BTreeSet, HashMap};
@@ -47,6 +53,8 @@ fn server_capabilities() -> ServerCapabilities {
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
+        document_highlight_provider: Some(OneOf::Left(true)),
+        folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
             resolve_provider: Some(false),
@@ -128,6 +136,12 @@ impl Server {
             References::METHOD => self
                 .references(request.params)
                 .and_then(|result| Ok(serde_json::to_value(result)?)),
+            DocumentHighlightRequest::METHOD => self
+                .document_highlight(request.params)
+                .and_then(|result| Ok(serde_json::to_value(result)?)),
+            FoldingRangeRequest::METHOD => self
+                .folding_range(request.params)
+                .and_then(|result| Ok(serde_json::to_value(result)?)),
             HoverRequest::METHOD => self
                 .hover(request.params)
                 .and_then(|result| Ok(serde_json::to_value(result)?)),
@@ -182,11 +196,13 @@ impl Server {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
         let parsed = self.parser.parse(params.text_document.text)?;
-        let analysis = DocumentAnalysis::analyze(&parsed, &self.workspace);
+        let workspace = self.document_workspace(&uri, parsed.text());
+        let analysis = DocumentAnalysis::analyze(&parsed, &workspace);
         let document = OpenDocument {
             version,
             parsed,
             analysis,
+            workspace,
         };
         self.publish_diagnostics(&uri, &document, connection)?;
         self.documents.insert(uri, document);
@@ -201,7 +217,7 @@ impl Server {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
         let pandoc = self.pandoc.clone();
-        let workspace = self.workspace.clone();
+        let base_workspace = self.workspace.clone();
         let Some(existing) = self.documents.get_mut(&uri) else {
             return Ok(());
         };
@@ -220,10 +236,13 @@ impl Server {
         }
 
         let parsed = self.parser.reparse(text, Some(&old_tree))?;
+        let document_path = uri.to_file_path().ok();
+        let workspace = base_workspace.for_document(document_path.as_deref(), parsed.text());
         let analysis = DocumentAnalysis::analyze(&parsed, &workspace);
         existing.version = version;
         existing.parsed = parsed;
         existing.analysis = analysis;
+        existing.workspace = workspace;
         let diagnostics = build_diagnostics(pandoc.as_ref(), existing);
         let version = existing.version;
         publish_diagnostics(connection, &uri, version, diagnostics)?;
@@ -262,6 +281,11 @@ impl Server {
             document.version,
             build_diagnostics(self.pandoc.as_ref(), document),
         )
+    }
+
+    fn document_workspace(&self, uri: &Url, text: &str) -> WorkspaceIndex {
+        let document_path = uri.to_file_path().ok();
+        self.workspace.for_document(document_path.as_deref(), text)
     }
 
     fn document_symbols(
@@ -350,31 +374,49 @@ impl Server {
             return Ok(None);
         };
 
-        let target = match symbol {
-            SymbolAtOffset::Heading(heading) => Some(heading.selection_range),
-            SymbolAtOffset::FencedDiv(div) => Some(div.id_range.unwrap_or(div.selection_range)),
-            SymbolAtOffset::ReferenceDefinition(definition) => Some(definition.label_range),
-            SymbolAtOffset::FootnoteDefinition(definition) => Some(definition.label_range),
+        let location = match symbol {
+            SymbolAtOffset::Heading(heading) => Some(document_location(
+                &uri,
+                document,
+                heading.id_range.unwrap_or(heading.selection_range),
+            )),
+            SymbolAtOffset::FencedDiv(div) => Some(document_location(
+                &uri,
+                document,
+                div.id_range.unwrap_or(div.selection_range),
+            )),
+            SymbolAtOffset::LocalReference(reference) => {
+                Some(document_location(&uri, document, reference.id_range))
+            }
+            SymbolAtOffset::ReferenceDefinition(definition) => {
+                Some(document_location(&uri, document, definition.label_range))
+            }
+            SymbolAtOffset::FootnoteDefinition(definition) => {
+                Some(document_location(&uri, document, definition.label_range))
+            }
             SymbolAtOffset::ReferenceLink(link) => document
                 .analysis
                 .reference_definition(&link.label)
-                .map(|definition| definition.label_range),
+                .map(|definition| document_location(&uri, document, definition.label_range)),
             SymbolAtOffset::FootnoteReference(reference) => document
                 .analysis
                 .footnote_definition(&reference.label)
-                .map(|definition| definition.label_range),
-            SymbolAtOffset::HeadingLink(link) => {
-                document.analysis.anchor_target_range(&link.anchor)
+                .map(|definition| document_location(&uri, document, definition.label_range)),
+            SymbolAtOffset::HeadingLink(link) => document
+                .analysis
+                .anchor_target_range(&link.anchor)
+                .map(|range| document_location(&uri, document, range)),
+            SymbolAtOffset::Citation(citation) => {
+                bibliography_definition_location(&document.workspace, citation).or_else(|| {
+                    document
+                        .analysis
+                        .anchor_target_range(&citation.key)
+                        .map(|range| document_location(&uri, document, range))
+                })
             }
-            SymbolAtOffset::Citation(_) => None,
         };
 
-        Ok(target.map(|range| {
-            GotoDefinitionResponse::Scalar(Location::new(
-                uri,
-                to_lsp_range(document.parsed.text(), document.parsed.line_index(), range),
-            ))
-        }))
+        Ok(location.map(GotoDefinitionResponse::Scalar))
     }
 
     fn references(&self, params: serde_json::Value) -> Result<Option<Vec<Location>>> {
@@ -400,22 +442,33 @@ impl Server {
                 .footnote_ranges_for_label(&reference.label),
             SymbolAtOffset::Heading(heading) => document
                 .analysis
-                .heading_link_ranges_for_anchor(&heading.anchor),
+                .local_reference_ranges_for_id(&heading.anchor),
             SymbolAtOffset::FencedDiv(div) => div
                 .id
                 .as_deref()
-                .map(|id| document.analysis.heading_link_ranges_for_anchor(id))
+                .map(|id| document.analysis.local_reference_ranges_for_id(id))
                 .unwrap_or_else(|| vec![div.selection_range]),
+            SymbolAtOffset::LocalReference(reference) => document
+                .analysis
+                .local_reference_ranges_for_id(&reference.id),
             SymbolAtOffset::HeadingLink(link) => document
                 .analysis
-                .heading_link_ranges_for_anchor(&link.anchor),
-            SymbolAtOffset::Citation(citation) => document
-                .analysis
-                .citations
-                .iter()
-                .filter(|other| other.key == citation.key)
-                .map(|other| other.key_range)
-                .collect(),
+                .local_reference_ranges_for_id(&link.anchor),
+            SymbolAtOffset::Citation(citation) => {
+                if document.analysis.local_reference(&citation.key).is_some() {
+                    document
+                        .analysis
+                        .local_reference_ranges_for_id(&citation.key)
+                } else {
+                    document
+                        .analysis
+                        .citations
+                        .iter()
+                        .filter(|other| other.key == citation.key)
+                        .map(|other| other.key_range)
+                        .collect()
+                }
+            }
         };
 
         let locations = ranges
@@ -430,6 +483,41 @@ impl Server {
         Ok(Some(locations))
     }
 
+    fn document_highlight(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let params: DocumentHighlightParams = serde_json::from_value(params)?;
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some((document, SymbolAtOffset::FencedDiv(div))) =
+            self.symbol_at_lsp_position(&uri, position)
+        else {
+            return Ok(None);
+        };
+
+        let highlights = fenced_div_highlights(document, div);
+        if highlights.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(highlights))
+        }
+    }
+
+    fn folding_range(&self, params: serde_json::Value) -> Result<Option<Vec<FoldingRange>>> {
+        let params: FoldingRangeParams = serde_json::from_value(params)?;
+        let Some(document) = self.documents.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+
+        let ranges = folding_ranges(document);
+        if ranges.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(ranges))
+        }
+    }
+
     fn hover(&self, params: serde_json::Value) -> Result<Option<Hover>> {
         let params: HoverParams = serde_json::from_value(params)?;
         let uri = params.text_document_position_params.text_document.uri;
@@ -440,13 +528,16 @@ impl Server {
 
         let (contents, range) = match symbol {
             SymbolAtOffset::Heading(heading) => (
-                format!("Heading anchor: `#{}`", heading.anchor),
+                format!(
+                    "Heading: `{}`\n\nAnchor: `#{}`",
+                    heading.title, heading.anchor
+                ),
                 heading.selection_range,
             ),
-            SymbolAtOffset::FencedDiv(div) => (
-                format!("Pandoc fenced div: `{}`", div.detail()),
-                div.selection_range,
-            ),
+            SymbolAtOffset::FencedDiv(div) => (fenced_div_hover_text(div), div.selection_range),
+            SymbolAtOffset::LocalReference(reference) => {
+                (local_reference_hover_text(reference), reference.id_range)
+            }
             SymbolAtOffset::ReferenceDefinition(definition) => (
                 format!("Reference target: `{}`", definition.target),
                 definition.label_range,
@@ -472,17 +563,20 @@ impl Server {
                 format!("Footnote reference `{}`", reference.label),
                 reference.label_range,
             ),
-            SymbolAtOffset::HeadingLink(link) => (
-                format!("Heading link `#{}`", link.anchor),
-                link.anchor_range,
-            ),
-            SymbolAtOffset::Citation(citation) => {
-                (format!("Citation `@{}`", citation.key), citation.key_range)
+            SymbolAtOffset::HeadingLink(link) => {
+                (heading_link_hover_text(document, link), link.anchor_range)
             }
+            SymbolAtOffset::Citation(citation) => (
+                citation_hover_text(document, &document.workspace, citation),
+                citation.key_range,
+            ),
         };
 
         Ok(Some(Hover {
-            contents: HoverContents::Scalar(MarkedString::String(contents)),
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: contents,
+            }),
             range: Some(to_lsp_range(
                 document.parsed.text(),
                 document.parsed.line_index(),
@@ -502,7 +596,7 @@ impl Server {
         if let Some(context) = citation_completion_context(document, position) {
             return Ok(Some(CompletionResponse::Array(citation_completion_items(
                 document,
-                &self.workspace,
+                &document.workspace,
                 Some(context.edit_range),
                 Some(context.prefix.as_str()),
             ))));
@@ -524,6 +618,330 @@ impl Server {
         let symbol = document.analysis.symbol_at(offset)?;
         Some((document, symbol))
     }
+}
+
+fn document_location(uri: &Url, document: &OpenDocument, range: TextRange) -> Location {
+    Location::new(
+        uri.clone(),
+        to_lsp_range(document.parsed.text(), document.parsed.line_index(), range),
+    )
+}
+
+fn bibliography_definition_location(
+    workspace: &WorkspaceIndex,
+    citation: &Citation,
+) -> Option<Location> {
+    let entry = workspace.citation_entry(&citation.key)?;
+    let source = entry.source.as_ref()?;
+    let text = std::fs::read_to_string(&source.path).ok()?;
+    let line_index = LineIndex::new(&text);
+    let uri = Url::from_file_path(&source.path).ok()?;
+
+    Some(Location::new(
+        uri,
+        to_lsp_range(&text, &line_index, source.key_range),
+    ))
+}
+
+fn folding_ranges(document: &OpenDocument) -> Vec<FoldingRange> {
+    let mut ranges = Vec::new();
+
+    push_heading_folding_ranges(document, &mut ranges);
+    for div in &document.analysis.fenced_divs {
+        push_folding_range(
+            &mut ranges,
+            document,
+            div.opening_range.start,
+            div.range.end,
+            None,
+        );
+    }
+    push_metadata_folding_ranges(document, &mut ranges);
+    push_code_fence_folding_ranges(document, &mut ranges);
+
+    ranges.sort_by_key(|range| (range.start_line, range.end_line));
+    ranges.dedup_by_key(|range| (range.start_line, range.end_line));
+    ranges
+}
+
+fn push_heading_folding_ranges(document: &OpenDocument, ranges: &mut Vec<FoldingRange>) {
+    let text = document.parsed.text();
+    let line_index = document.parsed.line_index();
+    let last_line = last_content_line(line_index, text);
+
+    for (index, heading) in document.analysis.headings.iter().enumerate() {
+        let start_line = line_index
+            .offset_to_position(text, heading.range.start)
+            .line;
+        let end_line = document
+            .analysis
+            .headings
+            .iter()
+            .skip(index + 1)
+            .find(|next| next.level <= heading.level)
+            .map(|next| {
+                line_index
+                    .offset_to_position(text, next.range.start)
+                    .line
+                    .saturating_sub(1)
+            })
+            .unwrap_or(last_line);
+
+        push_line_folding_range(ranges, start_line, end_line, None);
+    }
+}
+
+fn push_metadata_folding_ranges(document: &OpenDocument, ranges: &mut Vec<FoldingRange>) {
+    let mut lines = document.parsed.text().lines().enumerate();
+    let Some((start_line, first_line)) = lines.next() else {
+        return;
+    };
+    let delimiter = match first_line.trim_end_matches('\r') {
+        "---" => "---",
+        "+++" => "+++",
+        _ => return,
+    };
+
+    for (line_number, line) in lines {
+        if line.trim_end_matches('\r').trim() == delimiter {
+            push_line_folding_range(ranges, start_line as u32, line_number as u32, None);
+            return;
+        }
+    }
+}
+
+fn push_code_fence_folding_ranges(document: &OpenDocument, ranges: &mut Vec<FoldingRange>) {
+    let mut open = None::<(usize, char, usize)>;
+
+    for (line_number, line) in document.parsed.text().lines().enumerate() {
+        let Some((delimiter, len)) = code_fence_marker(line) else {
+            continue;
+        };
+
+        if let Some((open_line, open_delimiter, open_len)) = open {
+            if delimiter == open_delimiter && len >= open_len {
+                push_line_folding_range(ranges, open_line as u32, line_number as u32, None);
+                open = None;
+            }
+        } else {
+            open = Some((line_number, delimiter, len));
+        }
+    }
+}
+
+fn code_fence_marker(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    if line.len() - trimmed.len() > 3 {
+        return None;
+    }
+    let delimiter = trimmed.chars().next()?;
+    if !matches!(delimiter, '`' | '~') {
+        return None;
+    }
+    let len = trimmed.chars().take_while(|ch| *ch == delimiter).count();
+    (len >= 3).then_some((delimiter, len))
+}
+
+fn push_folding_range(
+    ranges: &mut Vec<FoldingRange>,
+    document: &OpenDocument,
+    start_offset: usize,
+    end_offset: usize,
+    collapsed_text: Option<String>,
+) {
+    let text = document.parsed.text();
+    let line_index = document.parsed.line_index();
+    let start_line = line_index.offset_to_position(text, start_offset).line;
+    let end_line = line_index
+        .offset_to_position(text, end_offset.saturating_sub(1))
+        .line;
+    push_line_folding_range(ranges, start_line, end_line, collapsed_text);
+}
+
+fn push_line_folding_range(
+    ranges: &mut Vec<FoldingRange>,
+    start_line: u32,
+    end_line: u32,
+    collapsed_text: Option<String>,
+) {
+    if end_line <= start_line {
+        return;
+    }
+
+    ranges.push(FoldingRange {
+        start_line,
+        start_character: None,
+        end_line,
+        end_character: None,
+        kind: None,
+        collapsed_text,
+    });
+}
+
+fn last_content_line(line_index: &LineIndex, text: &str) -> u32 {
+    let line_count = line_index.line_count();
+    if line_count == 0 {
+        return 0;
+    }
+    if text.ends_with('\n') && line_count > 1 {
+        (line_count - 2) as u32
+    } else {
+        (line_count - 1) as u32
+    }
+}
+
+fn fenced_div_highlights(document: &OpenDocument, div: &FencedDiv) -> Vec<DocumentHighlight> {
+    let mut ranges = vec![div.opening_range];
+    if let Some(closing_range) = div.closing_range {
+        if closing_range != div.opening_range {
+            ranges.push(closing_range);
+        }
+    }
+
+    ranges
+        .into_iter()
+        .map(|range| DocumentHighlight {
+            range: to_lsp_range(document.parsed.text(), document.parsed.line_index(), range),
+            kind: Some(DocumentHighlightKind::TEXT),
+        })
+        .collect()
+}
+
+fn citation_hover_text(
+    document: &OpenDocument,
+    workspace: &WorkspaceIndex,
+    citation: &Citation,
+) -> String {
+    if let Some(entry) = workspace.citation_entry(&citation.key) {
+        return bibliography_entry_hover_text(&citation.key, entry);
+    }
+
+    if let Some(div) = document.analysis.div_by_id(&citation.key) {
+        return fenced_div_hover_text(div);
+    }
+
+    if let Some(heading) = document.analysis.heading_by_anchor(&citation.key) {
+        return format!(
+            "Heading: `{}`\n\nAnchor: `#{}`",
+            heading.title, heading.anchor
+        );
+    }
+
+    if let Some(reference) = document.analysis.local_reference(&citation.key) {
+        return local_reference_hover_text(reference);
+    }
+
+    format!("Unresolved citation `@{}`", citation.key)
+}
+
+fn heading_link_hover_text(document: &OpenDocument, link: &HeadingLink) -> String {
+    if let Some(heading) = document.analysis.heading_by_anchor(&link.anchor) {
+        return format!(
+            "Heading: `{}`\n\nAnchor: `#{}`",
+            heading.title, heading.anchor
+        );
+    }
+
+    if let Some(div) = document.analysis.div_by_id(&link.anchor) {
+        return fenced_div_hover_text(div);
+    }
+
+    if let Some(reference) = document.analysis.local_reference(&link.anchor) {
+        return local_reference_hover_text(reference);
+    }
+
+    format!("Unresolved heading link `#{}`", link.anchor)
+}
+
+fn bibliography_entry_hover_text(key: &str, entry: &BibliographyEntry) -> String {
+    let mut details = Vec::new();
+    if let Some(authors) = &entry.authors {
+        details.push(format!("Author: {authors}"));
+    }
+    if let Some(title) = &entry.title {
+        details.push(format!("Title: {title}"));
+    }
+    if let Some(year) = &entry.year {
+        details.push(format!("Year: {year}"));
+    }
+
+    if details.is_empty() {
+        format!("Citation `@{key}`")
+    } else {
+        format!("`@{key}`\n\n{}", details.join("\n"))
+    }
+}
+
+fn local_reference_hover_text(reference: &pandocmd_analysis::LocalReference) -> String {
+    let detail = local_reference_display_detail(&reference.detail);
+    format!("{detail}: `#{}`", reference.id)
+}
+
+fn local_reference_display_detail(detail: &str) -> String {
+    let mut chars = detail.chars();
+    let Some(first) = chars.next() else {
+        return "Local Pandoc reference".to_string();
+    };
+    first.to_uppercase().chain(chars).collect()
+}
+
+fn fenced_div_hover_text(div: &FencedDiv) -> String {
+    let mut sections = vec![fenced_div_summary(div)];
+    let mut details = Vec::new();
+
+    if let Some(id) = &div.id {
+        details.push(format!("ID: {}", markdown_code(&format!("#{id}"))));
+    }
+    if !div.classes.is_empty() {
+        let classes = div
+            .classes
+            .iter()
+            .map(|class| markdown_code(class))
+            .collect::<Vec<_>>()
+            .join(", ");
+        details.push(format!("Classes: {classes}"));
+    }
+    if !div.attributes.is_empty() {
+        let attributes = div
+            .attributes
+            .iter()
+            .map(|attribute| {
+                let text = if let Some(value) = &attribute.value {
+                    format!("{}=\"{}\"", attribute.key, value)
+                } else {
+                    attribute.key.clone()
+                };
+                markdown_code(&text)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        details.push(format!("Attributes: {attributes}"));
+    }
+
+    if !details.is_empty() {
+        sections.push(details.join("\n"));
+    }
+
+    sections.join("\n\n")
+}
+
+fn fenced_div_summary(div: &FencedDiv) -> String {
+    let kind = div
+        .classes
+        .first()
+        .map(String::as_str)
+        .unwrap_or("fenced div");
+    let kind = markdown_code(kind);
+
+    if let Some(title) = div.title() {
+        format!("{kind}: {title}")
+    } else {
+        kind
+    }
+}
+
+fn markdown_code(text: &str) -> String {
+    format!("`{}`", text.replace('`', "\\`"))
 }
 
 struct CitationCompletionContext {
@@ -672,6 +1090,7 @@ struct OpenDocument {
     version: i32,
     parsed: ParsedDocument,
     analysis: DocumentAnalysis,
+    workspace: WorkspaceIndex,
 }
 
 fn apply_change(text: &mut String, range: Option<Range>, replacement: &str) {
@@ -831,6 +1250,140 @@ mod tests {
     }
 
     #[test]
+    fn citation_hover_uses_bibliography_title() -> Result<()> {
+        let document = test_document("See [@doe2024]\n")?;
+        let mut workspace = WorkspaceIndex::empty();
+        workspace.add_bibliography_text(
+            "@article{doe2024,\n author = {Jane Doe and John Smith},\n year = {2024},\n title = {Useful Result}\n}",
+        );
+        let citation = &document.analysis.citations[0];
+
+        let hover = citation_hover_text(&document, &workspace, citation);
+
+        assert!(hover.contains("Author: Doe and Smith"));
+        assert!(hover.contains("Title: Useful Result"));
+        assert!(hover.contains("Year: 2024"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn citation_definition_uses_bibliography_source_location() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "pandocmd-lsp-bib-definition-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)?;
+        let bibliography = root.join("refs.bib");
+        std::fs::write(
+            &bibliography,
+            "@article{first,\n title = {First}\n}\n@book{doe2024,\n title = {Useful Result}\n}\n",
+        )?;
+
+        let document = test_document("See [@doe2024]\n")?;
+        let mut workspace = WorkspaceIndex::empty();
+        workspace.add_bibliography_file(&bibliography);
+        let citation = &document.analysis.citations[0];
+
+        let location = bibliography_definition_location(&workspace, citation).unwrap();
+
+        assert_eq!(location.uri, Url::from_file_path(&bibliography).unwrap());
+        assert_eq!(
+            location.range,
+            Range::new(Position::new(3, 6), Position::new(3, 13))
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn citation_hover_uses_fenced_div_attributes() -> Result<()> {
+        let document = test_document(
+            "::: {#lem-main .Lemma title=\"Main result\" role=\"claim\"}\n:::\n\nSee [@lem-main]\n",
+        )?;
+        let workspace = WorkspaceIndex::empty();
+        let citation = &document.analysis.citations[0];
+
+        let hover = citation_hover_text(&document, &workspace, citation);
+
+        assert!(hover.contains("`Lemma`: Main result"));
+        assert!(hover.contains("ID: `#lem-main`"));
+        assert!(hover.contains("Classes: `Lemma`"));
+        assert!(hover.contains("Attributes: `title=\"Main result\"`, `role=\"claim\"`"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn citation_hover_uses_local_cross_reference_kinds() -> Result<()> {
+        let document = test_document("![Plot](plot.png){#fig-plot}\n\nSee [@fig-plot].\n")?;
+        let workspace = WorkspaceIndex::empty();
+        let citation = &document.analysis.citations[0];
+
+        let hover = citation_hover_text(&document, &workspace, citation);
+
+        assert_eq!(hover, "Figure: `#fig-plot`");
+
+        Ok(())
+    }
+
+    #[test]
+    fn fenced_div_hover_preserves_unbraced_class_name() -> Result<()> {
+        let document = test_document("::: Lemma\n:::\n")?;
+        let div = &document.analysis.fenced_divs[0];
+
+        assert!(fenced_div_hover_text(div).starts_with("`Lemma`"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn document_highlight_pairs_fenced_div_open_and_close() -> Result<()> {
+        let document = test_document("::: Lemma\ncontent\n:::\n")?;
+        let div = &document.analysis.fenced_divs[0];
+
+        let highlights = fenced_div_highlights(&document, div);
+
+        assert_eq!(highlights.len(), 2);
+        assert_eq!(
+            highlights[0].range,
+            Range::new(Position::new(0, 0), Position::new(0, 9))
+        );
+        assert_eq!(
+            highlights[1].range,
+            Range::new(Position::new(2, 0), Position::new(2, 3))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn folding_ranges_cover_document_blocks() -> Result<()> {
+        let document = test_document(
+            "---\ntitle: T\n---\n\n# Intro\npara\n\n```rust\nfn main() {}\n```\n\n::: {.note}\nbody\n:::\n\n## Nested\ntext\n\n# Next\n",
+        )?;
+
+        let ranges = folding_ranges(&document)
+            .into_iter()
+            .map(|range| (range.start_line, range.end_line))
+            .collect::<Vec<_>>();
+
+        assert!(ranges.contains(&(0, 2)), "YAML metadata should fold");
+        assert!(ranges.contains(&(4, 17)), "top-level heading should fold");
+        assert!(ranges.contains(&(7, 9)), "code fence should fold");
+        assert!(ranges.contains(&(11, 13)), "fenced div should fold");
+        assert!(ranges.contains(&(15, 17)), "nested heading should fold");
+        assert!(
+            !ranges.contains(&(18, 18)),
+            "single-line final heading should not fold"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn citation_completion_uses_fenced_div_title() -> Result<()> {
         let document =
             test_document("::: {#thm-main .theorem title=\"Main theorem\"}\n:::\n\nSee [@th]\n")?;
@@ -896,12 +1449,14 @@ mod tests {
     fn test_document(text: &str) -> Result<OpenDocument> {
         let mut parser = PandocMarkdownParser::new()?;
         let parsed = parser.parse(text.to_string())?;
-        let analysis = DocumentAnalysis::analyze(&parsed, &WorkspaceIndex::empty());
+        let workspace = WorkspaceIndex::empty();
+        let analysis = DocumentAnalysis::analyze(&parsed, &workspace);
 
         Ok(OpenDocument {
             version: 0,
             parsed,
             analysis,
+            workspace,
         })
     }
 }

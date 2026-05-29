@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use ignore::WalkBuilder;
@@ -59,6 +59,7 @@ pub struct Heading {
     pub anchor: String,
     pub range: TextRange,
     pub selection_range: TextRange,
+    pub id_range: Option<TextRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,7 +175,9 @@ impl FencedDiv {
 pub struct BibliographyEntry {
     pub key: String,
     pub authors: Option<String>,
+    pub title: Option<String>,
     pub year: Option<String>,
+    pub source: Option<BibliographySource>,
 }
 
 impl BibliographyEntry {
@@ -189,14 +192,25 @@ impl BibliographyEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BibliographySource {
+    pub path: PathBuf,
+    pub range: TextRange,
+    pub key_range: TextRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalReference {
     pub id: String,
     pub detail: String,
+    pub range: TextRange,
+    pub id_range: TextRange,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceIndex {
+    root: Option<PathBuf>,
     citations: HashMap<String, BibliographyEntry>,
+    duplicate_citation_keys: HashSet<String>,
 }
 
 impl WorkspaceIndex {
@@ -205,19 +219,24 @@ impl WorkspaceIndex {
     }
 
     pub fn from_root(root: &Path) -> Self {
-        let mut index = Self::default();
-        let walker = WalkBuilder::new(root)
-            .standard_filters(true)
-            .max_filesize(Some(2_000_000))
-            .build();
+        Self {
+            root: Some(root.to_path_buf()),
+            citations: HashMap::new(),
+            duplicate_citation_keys: HashSet::new(),
+        }
+    }
 
-        for entry in walker.flatten() {
-            let path = entry.path();
-            if !path.is_file() || !is_bibliography_file(path) {
-                continue;
-            }
-            if let Ok(text) = std::fs::read_to_string(path) {
-                index.add_bibliography_text(&text);
+    pub fn for_document(&self, document_path: Option<&Path>, text: &str) -> Self {
+        let bibliography_paths = bibliography_paths_from_metadata(text);
+        let mut index = Self {
+            root: self.root.clone(),
+            citations: HashMap::new(),
+            duplicate_citation_keys: HashSet::new(),
+        };
+
+        for bibliography_path in bibliography_paths {
+            for resolved_path in self.resolve_bibliography_path(document_path, &bibliography_path) {
+                index.add_bibliography_file(&resolved_path);
             }
         }
 
@@ -225,11 +244,43 @@ impl WorkspaceIndex {
     }
 
     pub fn add_bibliography_text(&mut self, text: &str) {
+        self.add_bibliography_text_with_source(text, None);
+    }
+
+    pub fn add_bibliography_file(&mut self, path: &Path) {
+        if !is_bibliography_file(path) {
+            return;
+        }
+        if let Ok(text) = std::fs::read_to_string(path) {
+            self.add_bibliography_text_with_source(&text, Some(path.to_path_buf()));
+        }
+    }
+
+    pub fn add_bibliography_files_from_root(&mut self, root: &Path) {
+        let walker = WalkBuilder::new(root)
+            .standard_filters(true)
+            .max_filesize(Some(2_000_000))
+            .build();
+
+        for entry in walker.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                self.add_bibliography_file(path);
+            }
+        }
+    }
+
+    fn add_bibliography_text_with_source(&mut self, text: &str, source_path: Option<PathBuf>) {
         for capture in BIB_ENTRY_START_RE.captures_iter(text) {
-            let Some(entry) = parse_bibliography_entry(text, &capture) else {
+            let Some(entry) = parse_bibliography_entry(text, &capture, source_path.as_deref())
+            else {
                 continue;
             };
-            self.citations.insert(entry.key.clone(), entry);
+            if self.citations.contains_key(&entry.key) {
+                self.duplicate_citation_keys.insert(entry.key.clone());
+            } else {
+                self.citations.insert(entry.key.clone(), entry);
+            }
         }
     }
 
@@ -252,13 +303,49 @@ impl WorkspaceIndex {
     pub fn citation_keys(&self) -> impl Iterator<Item = &str> {
         self.citations.keys().map(String::as_str)
     }
+
+    pub fn has_duplicate_citation_key(&self, key: &str) -> bool {
+        self.duplicate_citation_keys.contains(key)
+    }
+
+    fn resolve_bibliography_path(
+        &self,
+        document_path: Option<&Path>,
+        bibliography_path: &str,
+    ) -> Vec<PathBuf> {
+        let path = Path::new(bibliography_path);
+        if path.is_absolute() {
+            return path
+                .exists()
+                .then(|| path.to_path_buf())
+                .into_iter()
+                .collect();
+        }
+
+        let mut paths = Vec::new();
+        if let Some(document_dir) = document_path.and_then(Path::parent) {
+            paths.push(document_dir.join(path));
+        }
+        if let Some(root) = &self.root {
+            paths.push(root.join(path));
+        }
+
+        let mut seen = HashSet::new();
+        paths
+            .into_iter()
+            .filter(|path| path.exists())
+            .filter(|path| seen.insert(path.clone()))
+            .collect()
+    }
 }
 
 fn parse_bibliography_entry(
     text: &str,
     capture: &regex::Captures<'_>,
+    source_path: Option<&Path>,
 ) -> Option<BibliographyEntry> {
     let key = capture.get(1)?.as_str().trim().to_string();
+    let key_match = capture.get(1)?;
     let whole = capture.get(0)?;
     let matched = text.get(whole.start()..whole.end())?;
     let (open_relative, open_delimiter) = matched
@@ -277,12 +364,26 @@ fn parse_bibliography_entry(
         .get("author")
         .or_else(|| fields.get("editor"))
         .and_then(|value| bib_author_summary(value));
+    let title = fields
+        .get("title")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let year = fields
         .get("year")
         .or_else(|| fields.get("date"))
         .and_then(|value| bib_year(value));
 
-    Some(BibliographyEntry { key, authors, year })
+    Some(BibliographyEntry {
+        key,
+        authors,
+        title,
+        year,
+        source: source_path.map(|path| BibliographySource {
+            path: path.to_path_buf(),
+            range: TextRange::new(whole.start(), entry_end),
+            key_range: TextRange::new(key_match.start(), key_match.end()),
+        }),
+    })
 }
 
 fn find_bib_entry_end(text: &str, open_offset: usize, open_delimiter: char) -> Option<usize> {
@@ -496,6 +597,96 @@ fn bib_year(value: &str) -> Option<String> {
         .map(|year| year.as_str().to_string())
 }
 
+fn bibliography_paths_from_metadata(text: &str) -> Vec<String> {
+    let Some(metadata) = yaml_metadata_block(text) else {
+        return Vec::new();
+    };
+
+    let lines = metadata.lines().collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || !trimmed.starts_with("bibliography:") {
+            index += 1;
+            continue;
+        }
+
+        let indent = line.len() - trimmed.len();
+        let value = trimmed["bibliography:".len()..].trim();
+        if !value.is_empty() {
+            push_bibliography_values(value, &mut paths);
+            index += 1;
+            continue;
+        }
+
+        index += 1;
+        while index < lines.len() {
+            let child = lines[index];
+            let child_trimmed = child.trim_start();
+            let child_indent = child.len() - child_trimmed.len();
+            if child_trimmed.is_empty() || child_trimmed.starts_with('#') {
+                index += 1;
+                continue;
+            }
+            if child_indent <= indent {
+                break;
+            }
+            if let Some(value) = child_trimmed.strip_prefix('-') {
+                push_bibliography_values(value.trim(), &mut paths);
+            }
+            index += 1;
+        }
+    }
+
+    paths
+}
+
+fn yaml_metadata_block(text: &str) -> Option<&str> {
+    let first_line_end = text.find('\n')?;
+    let first_line = text[..first_line_end].trim_end_matches('\r');
+    if first_line != "---" {
+        return None;
+    }
+
+    let mut content_start = first_line_end + 1;
+    for line in text[content_start..].split_inclusive('\n') {
+        let line_end = content_start + line.len();
+        let line_without_newline = line.trim_end_matches(['\r', '\n']);
+        if matches!(line_without_newline.trim(), "---" | "...") {
+            return Some(&text[first_line_end + 1..content_start]);
+        }
+        content_start = line_end;
+    }
+
+    None
+}
+
+fn push_bibliography_values(value: &str, paths: &mut Vec<String>) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+
+    if value.starts_with('[') && value.ends_with(']') {
+        for item in value[1..value.len().saturating_sub(1)].split(',') {
+            push_bibliography_values(item, paths);
+        }
+        return;
+    }
+
+    let value = value
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches(['"', '\'']);
+    if !value.is_empty() {
+        paths.push(value.to_string());
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DocumentAnalysis {
     pub headings: Vec<Heading>,
@@ -506,6 +697,7 @@ pub struct DocumentAnalysis {
     pub heading_links: Vec<HeadingLink>,
     pub citations: Vec<Citation>,
     pub fenced_divs: Vec<FencedDiv>,
+    pub local_references: Vec<LocalReference>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -517,11 +709,16 @@ impl DocumentAnalysis {
     }
 
     pub fn local_reference_ids(&self, text: &str) -> HashSet<String> {
-        local_reference_ids(self, text)
+        let _ = text;
+        self.local_references
+            .iter()
+            .map(|reference| reference.id.clone())
+            .collect()
     }
 
     pub fn local_references(&self, text: &str) -> Vec<LocalReference> {
-        local_references(self, text)
+        let _ = text;
+        self.local_references.clone()
     }
 
     pub fn heading_by_anchor(&self, anchor: &str) -> Option<&Heading> {
@@ -550,9 +747,19 @@ impl DocumentAnalysis {
             .find(|div| div.id.as_deref() == Some(id))
     }
 
+    pub fn local_reference(&self, id: &str) -> Option<&LocalReference> {
+        self.local_references
+            .iter()
+            .find(|reference| reference.id == id)
+    }
+
     pub fn anchor_target_range(&self, anchor: &str) -> Option<TextRange> {
-        self.heading_by_anchor(anchor)
-            .map(|heading| heading.selection_range)
+        self.local_reference(anchor)
+            .map(|reference| reference.id_range)
+            .or_else(|| {
+                self.heading_by_anchor(anchor)
+                    .map(|heading| heading.id_range.unwrap_or(heading.selection_range))
+            })
             .or_else(|| {
                 self.div_by_id(anchor)
                     .map(|div| div.id_range.unwrap_or(div.selection_range))
@@ -566,8 +773,18 @@ impl DocumentAnalysis {
             }
         }
         for div in &self.fenced_divs {
-            if div.selection_range.contains(offset) || div.opening_range.contains(offset) {
+            if div.selection_range.contains(offset)
+                || div.opening_range.contains(offset)
+                || div
+                    .closing_range
+                    .is_some_and(|closing_range| closing_range.contains(offset))
+            {
                 return Some(SymbolAtOffset::FencedDiv(div));
+            }
+        }
+        for reference in &self.local_references {
+            if reference.id_range.contains(offset) {
+                return Some(SymbolAtOffset::LocalReference(reference));
             }
         }
         for definition in &self.reference_definitions {
@@ -596,7 +813,7 @@ impl DocumentAnalysis {
             }
         }
         for citation in &self.citations {
-            if citation.key_range.contains(offset) {
+            if citation.range.contains(offset) {
                 return Some(SymbolAtOffset::Citation(citation));
             }
         }
@@ -634,23 +851,39 @@ impl DocumentAnalysis {
     }
 
     pub fn heading_link_ranges_for_anchor(&self, anchor: &str) -> Vec<TextRange> {
-        self.headings
+        self.local_reference_ranges_for_id(anchor)
+    }
+
+    pub fn local_reference_ranges_for_id(&self, id: &str) -> Vec<TextRange> {
+        let mut ranges = Vec::new();
+        for heading in self.headings.iter().filter(|heading| heading.anchor == id) {
+            push_unique_range(
+                &mut ranges,
+                heading.id_range.unwrap_or(heading.selection_range),
+            );
+        }
+        for div in self
+            .fenced_divs
             .iter()
-            .filter(|heading| heading.anchor == anchor)
-            .map(|heading| heading.selection_range)
-            .chain(
-                self.fenced_divs
-                    .iter()
-                    .filter(|div| div.id.as_deref() == Some(anchor))
-                    .map(|div| div.id_range.unwrap_or(div.selection_range)),
-            )
-            .chain(
-                self.heading_links
-                    .iter()
-                    .filter(|link| link.anchor == anchor)
-                    .map(|link| link.anchor_range),
-            )
-            .collect()
+            .filter(|div| div.id.as_deref() == Some(id))
+        {
+            push_unique_range(&mut ranges, div.id_range.unwrap_or(div.selection_range));
+        }
+        for reference in self
+            .local_references
+            .iter()
+            .filter(|reference| reference.id == id)
+        {
+            push_unique_range(&mut ranges, reference.id_range);
+        }
+        for link in self.heading_links.iter().filter(|link| link.anchor == id) {
+            push_unique_range(&mut ranges, link.anchor_range);
+        }
+        for citation in self.citations.iter().filter(|citation| citation.key == id) {
+            push_unique_range(&mut ranges, citation.key_range);
+        }
+
+        ranges
     }
 
     fn add_diagnostics(&mut self, document: &ParsedDocument, workspace: &WorkspaceIndex) {
@@ -735,10 +968,9 @@ impl DocumentAnalysis {
         }
 
         let anchors = self
-            .headings
+            .local_references
             .iter()
-            .map(|heading| heading.anchor.as_str())
-            .chain(self.fenced_divs.iter().filter_map(|div| div.id.as_deref()))
+            .map(|reference| reference.id.as_str())
             .collect::<HashSet<_>>();
         for link in &self.heading_links {
             if !anchors.contains(link.anchor.as_str()) {
@@ -754,6 +986,14 @@ impl DocumentAnalysis {
         let local_refs = self.local_reference_ids(document.text());
         if workspace.has_citation_keys() {
             for citation in &self.citations {
+                if workspace.has_duplicate_citation_key(&citation.key) {
+                    self.diagnostics.push(Diagnostic {
+                        range: citation.key_range,
+                        severity: Severity::Warning,
+                        code: "duplicate-bib-key",
+                        message: format!("duplicate bibliography key `@{}`", citation.key),
+                    });
+                }
                 if !workspace.contains_citation_key(&citation.key)
                     && !local_refs.contains(&citation.key)
                 {
@@ -773,6 +1013,7 @@ impl DocumentAnalysis {
 pub enum SymbolAtOffset<'a> {
     Heading(&'a Heading),
     FencedDiv(&'a FencedDiv),
+    LocalReference(&'a LocalReference),
     ReferenceDefinition(&'a ReferenceDefinition),
     FootnoteDefinition(&'a FootnoteDefinition),
     ReferenceLink(&'a ReferenceLink),
@@ -818,6 +1059,22 @@ pub fn normalize_label(label: &str) -> String {
         .to_lowercase()
 }
 
+#[derive(Debug)]
+struct ParsedHeading {
+    title: String,
+    title_range: TextRange,
+    id: Option<String>,
+    id_range: Option<TextRange>,
+}
+
+#[derive(Debug)]
+struct BracedAttributeSet {
+    whole_range: TextRange,
+    id: Option<String>,
+    id_range: Option<TextRange>,
+    classes: Vec<String>,
+}
+
 fn scan_document(text: &str) -> DocumentAnalysis {
     let mut analysis = DocumentAnalysis::default();
     let mut byte_offset = 0;
@@ -857,6 +1114,100 @@ fn scan_document(text: &str) -> DocumentAnalysis {
     analysis
 }
 
+fn parse_heading_title_and_attributes(
+    line: &str,
+    byte_offset: usize,
+    title_match: regex::Match<'_>,
+) -> ParsedHeading {
+    let (title_start, title_end) =
+        trimmed_heading_title_range(line, title_match.start(), title_match.end());
+    let mut title_range = TextRange::new(byte_offset + title_start, byte_offset + title_end);
+    let mut title = line[title_start..title_end].to_string();
+    let mut id = None;
+    let mut id_range = None;
+
+    if let Some(attributes) = braced_attribute_sets(line, byte_offset)
+        .into_iter()
+        .filter(|attributes| {
+            let start = attributes.whole_range.start.saturating_sub(byte_offset);
+            let end = attributes.whole_range.end.saturating_sub(byte_offset);
+            title_start <= start && end == title_end
+        })
+        .next_back()
+    {
+        if attributes.id.is_some() {
+            let attr_start = attributes.whole_range.start.saturating_sub(byte_offset);
+            let display_end = trim_ascii_whitespace_end(line, title_start, attr_start);
+            title_range = TextRange::new(byte_offset + title_start, byte_offset + display_end);
+            title = line[title_start..display_end].to_string();
+            id = attributes.id;
+            id_range = attributes.id_range;
+        }
+    }
+
+    ParsedHeading {
+        title,
+        title_range,
+        id,
+        id_range,
+    }
+}
+
+fn trimmed_heading_title_range(line: &str, mut start: usize, mut end: usize) -> (usize, usize) {
+    while start < end && line.as_bytes()[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    end = trim_ascii_whitespace_end(line, start, end);
+    while end > start && line.as_bytes()[end - 1] == b'#' {
+        end -= 1;
+        end = trim_ascii_whitespace_end(line, start, end);
+    }
+    (start, end)
+}
+
+fn trim_ascii_whitespace_end(line: &str, start: usize, mut end: usize) -> usize {
+    while end > start && line.as_bytes()[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    end
+}
+
+fn braced_attribute_sets(line: &str, byte_offset: usize) -> Vec<BracedAttributeSet> {
+    let mut attributes = Vec::new();
+    for captures in BRACED_ATTR_RE.captures_iter(line) {
+        let Some(whole) = captures.get(0) else {
+            continue;
+        };
+        let inner = captures.get(1).unwrap();
+        let tokens = tokenize_attributes(inner.as_str(), byte_offset + inner.start());
+        let mut id = None;
+        let mut id_range = None;
+        let mut classes = Vec::new();
+
+        for token in tokens {
+            if let Some(token_id) = token.text.strip_prefix('#') {
+                if !token_id.is_empty() {
+                    id = Some(token_id.to_string());
+                    id_range = Some(TextRange::new(token.range.start + 1, token.range.end));
+                }
+            } else if let Some(class) = token.text.strip_prefix('.') {
+                if !class.is_empty() {
+                    classes.push(class.to_string());
+                }
+            }
+        }
+
+        attributes.push(BracedAttributeSet {
+            whole_range: TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+            id,
+            id_range,
+            classes,
+        });
+    }
+
+    attributes
+}
+
 fn scan_block_line(
     line: &str,
     byte_offset: usize,
@@ -866,24 +1217,37 @@ fn scan_block_line(
     if let Some(captures) = HEADING_RE.captures(line) {
         let marker = captures.get(1).unwrap();
         let title_match = captures.get(2).unwrap();
-        let title = title_match.as_str().trim().trim_end_matches('#').trim();
-        let base_anchor = slugify_heading(title);
-        let count = anchor_counts.entry(base_anchor.clone()).or_insert(0);
-        let anchor = if *count == 0 {
+        let heading = parse_heading_title_and_attributes(line, byte_offset, title_match);
+        let base_anchor = heading
+            .id
+            .clone()
+            .unwrap_or_else(|| slugify_heading(&heading.title));
+        let anchor = if heading.id.is_some() {
             base_anchor
         } else {
-            format!("{base_anchor}-{}", *count)
+            let count = anchor_counts.entry(base_anchor.clone()).or_insert(0);
+            let anchor = if *count == 0 {
+                base_anchor
+            } else {
+                format!("{base_anchor}-{}", *count)
+            };
+            *count += 1;
+            anchor
         };
-        *count += 1;
 
-        let selection_start = byte_offset + title_match.start();
-        let selection_end = selection_start + title.len();
         analysis.headings.push(Heading {
             level: marker.as_str().len() as u8,
-            title: title.to_string(),
-            anchor,
+            title: heading.title,
+            anchor: anchor.clone(),
             range: TextRange::new(byte_offset, byte_offset + line.len()),
-            selection_range: TextRange::new(selection_start, selection_end),
+            selection_range: heading.title_range,
+            id_range: heading.id_range,
+        });
+        analysis.local_references.push(LocalReference {
+            id: anchor,
+            detail: "section".to_string(),
+            range: TextRange::new(byte_offset, byte_offset + line.len()),
+            id_range: heading.id_range.unwrap_or(heading.title_range),
         });
         return;
     }
@@ -975,6 +1339,8 @@ fn scan_inline_line(line: &str, byte_offset: usize, analysis: &mut DocumentAnaly
             key_range: TextRange::new(byte_offset + key.start(), byte_offset + key.end()),
         });
     }
+
+    scan_braced_attribute_references(line, byte_offset, analysis);
 }
 
 #[derive(Debug)]
@@ -1040,6 +1406,16 @@ fn scan_fenced_div_line(
         selection_range,
         id_range: parsed.id_range,
     });
+    if let Some(div) = analysis.fenced_divs.get(index) {
+        if let Some(id) = &div.id {
+            analysis.local_references.push(LocalReference {
+                id: id.clone(),
+                detail: fenced_div_reference_detail(div),
+                range: div.opening_range,
+                id_range: div.id_range.unwrap_or(div.selection_range),
+            });
+        }
+    }
     div_stack.push(OpenDiv {
         index,
         fence_len,
@@ -1316,18 +1692,19 @@ fn push_duplicate_diagnostics<'a>(
     }
 }
 
+fn push_unique_range(ranges: &mut Vec<TextRange>, range: TextRange) {
+    if !ranges.contains(&range) {
+        ranges.push(range);
+    }
+}
+
 fn duplicate_anchor_diagnostics(analysis: &DocumentAnalysis) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut seen = HashSet::<String>::new();
     for (anchor, range) in analysis
-        .headings
+        .local_references
         .iter()
-        .map(|heading| (heading.anchor.as_str(), heading.selection_range))
-        .chain(analysis.fenced_divs.iter().filter_map(|div| {
-            div.id
-                .as_deref()
-                .map(|id| (id, div.id_range.unwrap_or(div.selection_range)))
-        }))
+        .map(|reference| (reference.id.as_str(), reference.id_range))
     {
         if !seen.insert(anchor.to_string()) {
             diagnostics.push(Diagnostic {
@@ -1339,46 +1716,6 @@ fn duplicate_anchor_diagnostics(analysis: &DocumentAnalysis) -> Vec<Diagnostic> 
         }
     }
     diagnostics
-}
-
-fn local_reference_ids(analysis: &DocumentAnalysis, text: &str) -> HashSet<String> {
-    local_references(analysis, text)
-        .into_iter()
-        .map(|reference| reference.id)
-        .collect()
-}
-
-fn local_references(analysis: &DocumentAnalysis, text: &str) -> Vec<LocalReference> {
-    let mut references = HashMap::<String, String>::new();
-
-    for heading in &analysis.headings {
-        insert_local_reference(&mut references, heading.anchor.clone(), "section");
-    }
-    for div in &analysis.fenced_divs {
-        if let Some(id) = &div.id {
-            insert_local_reference(
-                &mut references,
-                id.clone(),
-                fenced_div_reference_detail(div),
-            );
-        }
-    }
-    for reference in braced_attribute_references(text) {
-        insert_local_reference(&mut references, reference.id, reference.detail);
-    }
-
-    references
-        .into_iter()
-        .map(|(id, detail)| LocalReference { id, detail })
-        .collect()
-}
-
-fn insert_local_reference(
-    references: &mut HashMap<String, String>,
-    id: String,
-    detail: impl Into<String>,
-) {
-    references.entry(id).or_insert_with(|| detail.into());
 }
 
 fn fenced_div_reference_detail(div: &FencedDiv) -> String {
@@ -1395,37 +1732,35 @@ fn fenced_div_reference_detail(div: &FencedDiv) -> String {
     }
 }
 
-fn braced_attribute_references(text: &str) -> Vec<LocalReference> {
-    let mut references = Vec::new();
-    for line in text.lines() {
-        for captures in BRACED_ATTR_RE.captures_iter(line) {
-            let Some(whole) = captures.get(0) else {
-                continue;
-            };
-            let inner = captures.get(1).unwrap();
-            let tokens = tokenize_attributes(inner.as_str(), inner.start());
-            let classes = tokens
-                .iter()
-                .filter_map(|token| token.text.strip_prefix('.'))
-                .filter(|class| !class.is_empty())
-                .collect::<Vec<_>>();
-
-            for token in &tokens {
-                let Some(id) = token.text.strip_prefix('#') else {
-                    continue;
-                };
-                if id.is_empty() {
-                    continue;
-                }
-                references.push(LocalReference {
-                    id: id.to_string(),
-                    detail: braced_attribute_reference_detail(line, whole.start(), id, &classes),
-                });
-            }
-        }
+fn scan_braced_attribute_references(
+    line: &str,
+    byte_offset: usize,
+    analysis: &mut DocumentAnalysis,
+) {
+    if HEADING_RE.is_match(line) || FENCED_DIV_RE.is_match(line) {
+        return;
     }
 
-    references
+    for attributes in braced_attribute_sets(line, byte_offset) {
+        let Some(id) = attributes.id else {
+            continue;
+        };
+        let Some(id_range) = attributes.id_range else {
+            continue;
+        };
+        let attr_start = attributes.whole_range.start.saturating_sub(byte_offset);
+        let classes = attributes
+            .classes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        analysis.local_references.push(LocalReference {
+            id: id.clone(),
+            detail: braced_attribute_reference_detail(line, attr_start, &id, &classes),
+            range: attributes.whole_range,
+            id_range,
+        });
+    }
 }
 
 fn braced_attribute_reference_detail(
@@ -1451,7 +1786,7 @@ fn braced_attribute_reference_detail(
         return "figure".to_string();
     }
     if CODE_FENCE_ATTR_PREFIX_RE.is_match(prefix) {
-        return "code block".to_string();
+        return "listing".to_string();
     }
     "local Pandoc reference".to_string()
 }
@@ -1476,6 +1811,7 @@ fn reference_type_from_id(id: &str) -> Option<&'static str> {
         "cor" | "corollary" => Some("corollary"),
         "prop" | "proposition" => Some("proposition"),
         "ex" | "example" => Some("example"),
+        "span" => Some("span"),
         _ => None,
     }
 }
@@ -1572,12 +1908,32 @@ mod tests {
     }
 
     #[test]
+    fn finds_fenced_div_from_closing_fence() {
+        let text = "::: Lemma\ncontent\n:::\n";
+        let mut parser = PandocMarkdownParser::new().unwrap();
+        let document = parser.parse(text).unwrap();
+        let analysis = DocumentAnalysis::analyze(&document, &WorkspaceIndex::empty());
+        let closing_offset = text.rfind(":::").unwrap();
+
+        assert!(matches!(
+            analysis.symbol_at(closing_offset),
+            Some(SymbolAtOffset::FencedDiv(div)) if div.classes == vec!["Lemma"]
+        ));
+    }
+
+    #[test]
     fn reads_bibliography_keys() {
         let mut workspace = WorkspaceIndex::empty();
         workspace.add_bibliography_text(
             "@article{doe2024,\n author = {Jane Doe and John Smith},\n year = {2024},\n title = {T}\n}\n@book{roe2023,\n editor = {Richard Roe},\n date = {2023-05-01}\n}",
         );
         assert!(workspace.contains_citation_key("doe2024"));
+        assert_eq!(
+            workspace
+                .citation_entry("doe2024")
+                .and_then(|entry| entry.title.as_deref()),
+            Some("T")
+        );
         assert_eq!(
             workspace
                 .citation_entry("doe2024")
@@ -1595,8 +1951,67 @@ mod tests {
     }
 
     #[test]
+    fn reads_bibliography_from_yaml_metadata_only() {
+        let root =
+            std::env::temp_dir().join(format!("pandocmd-bib-metadata-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("refs.bib"),
+            "@article{listed,\n title = {Listed}\n}\n@book{dup,\n title = {One}\n}\n@book{dup,\n title = {Two}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("unlisted.bib"),
+            "@article{unlisted,\n title = {Unlisted}\n}\n",
+        )
+        .unwrap();
+
+        let text = "---\nbibliography:\n  - refs.bib\n---\n\nSee [@listed].\n";
+        let workspace =
+            WorkspaceIndex::from_root(&root).for_document(Some(&root.join("main.md")), text);
+
+        assert!(workspace.contains_citation_key("listed"));
+        assert!(!workspace.contains_citation_key("unlisted"));
+        assert!(workspace.has_duplicate_citation_key("dup"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn diagnoses_duplicate_bibliography_keys_at_citations() {
+        let text = "See [@dup].\n";
+        let mut workspace = WorkspaceIndex::empty();
+        workspace.add_bibliography_text(
+            "@article{dup,\n title = {One}\n}\n@book{dup,\n title = {Two}\n}\n",
+        );
+        let mut parser = PandocMarkdownParser::new().unwrap();
+        let document = parser.parse(text).unwrap();
+        let analysis = DocumentAnalysis::analyze(&document, &workspace);
+
+        assert!(analysis
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "duplicate-bib-key"));
+    }
+
+    #[test]
+    fn finds_citation_from_at_sigil() {
+        let text = "See [@doe2024].\n";
+        let mut parser = PandocMarkdownParser::new().unwrap();
+        let document = parser.parse(text).unwrap();
+        let analysis = DocumentAnalysis::analyze(&document, &WorkspaceIndex::empty());
+        let at_offset = text.find('@').unwrap();
+
+        assert!(matches!(
+            analysis.symbol_at(at_offset),
+            Some(SymbolAtOffset::Citation(citation)) if citation.key == "doe2024"
+        ));
+    }
+
+    #[test]
     fn classifies_local_cross_references() {
-        let text = "# Intro {#sec-custom}\n\n::: {#thm-main .theorem title=\"Main theorem\"}\nContent.\n:::\n\n![Plot](plot.png){#plot}\n\n[^note]: Footnote\n";
+        let text = "# Intro {#sec-custom}\n\n::: {#thm-main .theorem title=\"Main theorem\"}\nContent.\n:::\n\n![Plot](plot.png){#plot}\n\n```{#lst-demo .rust}\nfn main() {}\n```\n\n$$ x = y $$ {#eq-main}\n\n[Term]{#span-term}\n\nSee [@plot] and [Plot](#plot).\n\n[^note]: Footnote\n";
         let mut parser = PandocMarkdownParser::new().unwrap();
         let document = parser.parse(text).unwrap();
         let analysis = DocumentAnalysis::analyze(&document, &WorkspaceIndex::empty());
@@ -1615,6 +2030,23 @@ mod tests {
             Some("theorem: Main theorem")
         );
         assert_eq!(references.get("plot").map(String::as_str), Some("figure"));
+        assert_eq!(
+            references.get("lst-demo").map(String::as_str),
+            Some("listing")
+        );
+        assert_eq!(
+            references.get("eq-main").map(String::as_str),
+            Some("equation")
+        );
+        assert_eq!(
+            references.get("span-term").map(String::as_str),
+            Some("span")
+        );
+        assert_eq!(
+            analysis.local_reference_ranges_for_id("plot").len(),
+            3,
+            "target id, [@plot], and (#plot) should all be indexed"
+        );
         assert!(!references.contains_key("note"));
     }
 
