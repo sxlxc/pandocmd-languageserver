@@ -121,6 +121,7 @@ pub struct FencedDiv {
     pub id: Option<String>,
     pub classes: Vec<String>,
     pub attributes: Vec<DivAttribute>,
+    pub caption: Option<String>,
     pub fence_len: usize,
     pub range: TextRange,
     pub opening_range: TextRange,
@@ -166,6 +167,7 @@ impl FencedDiv {
             .iter()
             .find(|attribute| attribute.key.eq_ignore_ascii_case("title"))
             .and_then(|attribute| attribute.value.as_deref())
+            .or(self.caption.as_deref())
             .map(str::trim)
             .filter(|title| !title.is_empty())
     }
@@ -1357,6 +1359,7 @@ struct ParsedDivAttributes {
     classes: Vec<String>,
     class_ranges: Vec<TextRange>,
     attributes: Vec<DivAttribute>,
+    caption: Option<String>,
     selection_range: TextRange,
     diagnostics: Vec<Diagnostic>,
 }
@@ -1365,6 +1368,14 @@ struct ParsedDivAttributes {
 struct AttrToken<'a> {
     text: &'a str,
     range: TextRange,
+}
+
+#[derive(Debug)]
+struct DivAttributeText<'a> {
+    text: &'a str,
+    offset: usize,
+    range: TextRange,
+    trailing_caption: Option<&'a str>,
 }
 
 fn scan_fenced_div_line(
@@ -1399,6 +1410,7 @@ fn scan_fenced_div_line(
         id: parsed.id,
         classes: parsed.classes,
         attributes: parsed.attributes,
+        caption: parsed.caption,
         fence_len,
         range: line_range,
         opening_range: line_range,
@@ -1482,18 +1494,19 @@ fn parse_div_attributes(
     rest_offset: usize,
     fallback_range: TextRange,
 ) -> ParsedDivAttributes {
-    let (attr_text, attr_offset, attr_range) = trim_div_attribute_text(rest, rest_offset);
+    let attributes = trim_div_attribute_text(rest, rest_offset);
     let mut parsed = ParsedDivAttributes {
         id: None,
         id_range: None,
         classes: Vec::new(),
         class_ranges: Vec::new(),
         attributes: Vec::new(),
-        selection_range: attr_range,
+        caption: attributes.trailing_caption.map(str::to_string),
+        selection_range: attributes.range,
         diagnostics: Vec::new(),
     };
 
-    if attr_text.is_empty() {
+    if attributes.text.is_empty() {
         parsed.selection_range = fallback_range;
         parsed.diagnostics.push(Diagnostic {
             range: fallback_range,
@@ -1505,47 +1518,62 @@ fn parse_div_attributes(
         return parsed;
     }
 
-    if attr_text.starts_with('{') {
-        if !attr_text.ends_with('}') {
+    if attributes.text.starts_with('{') {
+        if !attributes.text.ends_with('}') {
             parsed.diagnostics.push(Diagnostic {
-                range: attr_range,
+                range: attributes.range,
                 severity: Severity::Warning,
                 code: "malformed-fenced-div-attributes",
                 message: "fenced div attributes should be enclosed with `{` and `}`".to_string(),
             });
         }
 
-        let inner_start = usize::from(attr_text.starts_with('{'));
-        let inner_end = if attr_text.ends_with('}') {
-            attr_text.len().saturating_sub(1)
+        let inner_start = usize::from(attributes.text.starts_with('{'));
+        let inner_end = if attributes.text.ends_with('}') {
+            attributes.text.len().saturating_sub(1)
         } else {
-            attr_text.len()
+            attributes.text.len()
         };
-        let inner = &attr_text[inner_start..inner_end];
-        parse_braced_div_attributes(inner, attr_offset + inner_start, &mut parsed);
+        let inner = &attributes.text[inner_start..inner_end];
+        parse_braced_div_attributes(inner, attributes.offset + inner_start, &mut parsed);
     } else {
-        parse_unbraced_div_attributes(attr_text, attr_range, &mut parsed);
+        parse_unbraced_div_attributes(attributes.text, attributes.range, &mut parsed);
     }
 
     parsed
 }
 
-fn trim_div_attribute_text(rest: &str, rest_offset: usize) -> (&str, usize, TextRange) {
+fn trim_div_attribute_text(rest: &str, rest_offset: usize) -> DivAttributeText<'_> {
     let leading = rest.len() - rest.trim_start().len();
     let mut end = rest.trim_end().len();
-    let mut attr_text = &rest[leading..end];
+    let mut text = &rest[leading..end];
 
-    if let Some(trailing_start) = trailing_colon_fence_start(attr_text) {
-        end = leading + attr_text[..trailing_start].trim_end().len();
-        attr_text = &rest[leading..end];
+    if let Some(trailing_start) = trailing_colon_fence_start(text) {
+        end = leading + text[..trailing_start].trim_end().len();
+        text = &rest[leading..end];
     }
 
     let attr_offset = rest_offset + leading;
-    (
-        attr_text,
-        attr_offset,
-        TextRange::new(attr_offset, attr_offset + attr_text.len()),
-    )
+    let mut attr_text = text;
+    let mut trailing_caption = None;
+
+    if text.starts_with('{') {
+        if let Some(closing_brace) = matching_attribute_close_brace(text) {
+            let attr_end = closing_brace + 1;
+            attr_text = &text[..attr_end];
+            let caption = text[attr_end..].trim();
+            if !caption.is_empty() {
+                trailing_caption = Some(caption);
+            }
+        }
+    }
+
+    DivAttributeText {
+        text: attr_text,
+        offset: attr_offset,
+        range: TextRange::new(attr_offset, attr_offset + attr_text.len()),
+        trailing_caption,
+    }
 }
 
 fn trailing_colon_fence_start(text: &str) -> Option<usize> {
@@ -1553,6 +1581,40 @@ fn trailing_colon_fence_start(text: &str) -> Option<usize> {
     let token_start = trimmed.rfind(char::is_whitespace).map(|index| index + 1)?;
     let token = &trimmed[token_start..];
     (token.len() >= 3 && token.chars().all(|ch| ch == ':')).then_some(token_start)
+}
+
+fn matching_attribute_close_brace(text: &str) -> Option<usize> {
+    debug_assert!(text.starts_with('{'));
+
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, ch) in text.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+        } else if ch == '}' {
+            return Some(index);
+        }
+    }
+
+    None
 }
 
 fn parse_braced_div_attributes(inner: &str, inner_offset: usize, parsed: &mut ParsedDivAttributes) {
@@ -1874,6 +1936,33 @@ mod tests {
             .diagnostics
             .iter()
             .all(|diagnostic| diagnostic.code != "unresolved-heading"));
+    }
+
+    #[test]
+    fn extracts_fenced_div_attributes_before_inline_caption() {
+        let caption =
+            "Cogirth-strength ratio bounds and resulting deterministic rank-$j$-reduction runtimes.";
+        let text = format!("::: {{.table #tbl:applications}} {caption}\nsome table\n:::\n\nSee [@tbl:applications].\n");
+        let mut parser = PandocMarkdownParser::new().unwrap();
+        let document = parser.parse(text).unwrap();
+        let analysis = DocumentAnalysis::analyze(&document, &WorkspaceIndex::empty());
+
+        assert_eq!(analysis.fenced_divs.len(), 1);
+        assert_eq!(
+            analysis.fenced_divs[0].id.as_deref(),
+            Some("tbl:applications")
+        );
+        assert_eq!(analysis.fenced_divs[0].classes, vec!["table"]);
+        assert_eq!(analysis.fenced_divs[0].title(), Some(caption));
+        assert!(analysis.local_reference("tbl:applications").is_some());
+        assert_eq!(analysis.citations[0].key, "tbl:applications");
+        assert!(analysis
+            .local_reference_ranges_for_id("tbl:applications")
+            .contains(&analysis.citations[0].key_range));
+        assert!(analysis.diagnostics.iter().all(|diagnostic| !matches!(
+            diagnostic.code,
+            "malformed-fenced-div-attributes" | "syntax"
+        )));
     }
 
     #[test]

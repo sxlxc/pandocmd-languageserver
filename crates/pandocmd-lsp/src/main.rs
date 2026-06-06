@@ -1405,6 +1405,31 @@ mod tests {
     }
 
     #[test]
+    fn citation_completion_uses_fenced_div_inline_caption() -> Result<()> {
+        let document = test_document(
+            "::: {.table #tbl:applications} Cogirth-strength ratio bounds.\nsome table\n:::\n\nSee [@tbl]\n",
+        )?;
+        let workspace = WorkspaceIndex::empty();
+        let context = citation_completion_context(&document, Position::new(4, 9)).unwrap();
+
+        let items = citation_completion_items(
+            &document,
+            &workspace,
+            Some(context.edit_range),
+            Some(context.prefix.as_str()),
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "@tbl:applications");
+        assert_eq!(
+            items[0].detail.as_deref(),
+            Some("table: Cogirth-strength ratio bounds.")
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn citation_completion_excludes_footnote_labels() -> Result<()> {
         let document = test_document("[^note]: Footnote\n\nSee [@no]\n")?;
         let workspace = WorkspaceIndex::empty();
