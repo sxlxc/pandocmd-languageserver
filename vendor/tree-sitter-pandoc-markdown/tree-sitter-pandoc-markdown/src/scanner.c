@@ -177,6 +177,11 @@ static const bool paragraph_interrupt_symbols[] = {
 static const uint8_t STATE_MATCHING = 0x1 << 0;
 // Last line break was inside a paragraph
 static const uint8_t STATE_WAS_SOFT_LINE_BREAK = 0x1 << 1;
+// Currently inside a Pandoc display math block.
+static const uint8_t STATE_IN_BRACKETED_LATEX_BLOCK = 0x1 << 2;
+static const uint8_t STATE_IN_DOLLAR_LATEX_BLOCK = 0x1 << 3;
+static const uint8_t STATE_IN_LATEX_BLOCK =
+    STATE_IN_BRACKETED_LATEX_BLOCK | STATE_IN_DOLLAR_LATEX_BLOCK;
 // Block should be closed after next line break
 static const uint8_t STATE_CLOSE_BLOCK = 0x1 << 4;
 
@@ -615,6 +620,105 @@ static bool parse_setext_underline(Scanner *s, TSLexer *lexer,
             lexer->result_symbol = SETEXT_H1_UNDERLINE;
             mark_end(s, lexer);
             return true;
+        }
+    }
+    return false;
+}
+
+static bool has_multiline_backslash_latex_close(Scanner *s, TSLexer *lexer) {
+    bool saw_line_break = false;
+
+    while (!lexer->eof(lexer)) {
+        if (lexer->lookahead == '\n' || lexer->lookahead == '\r') {
+            saw_line_break = true;
+            if (lexer->lookahead == '\r') {
+                advance(s, lexer);
+                if (lexer->lookahead == '\n') {
+                    advance(s, lexer);
+                }
+            } else {
+                advance(s, lexer);
+            }
+        } else if (lexer->lookahead == '\\') {
+            advance(s, lexer);
+            if (lexer->lookahead == ']') {
+                return saw_line_break;
+            }
+        } else {
+            advance(s, lexer);
+        }
+    }
+
+    return false;
+}
+
+static bool has_multiline_dollar_latex_close(Scanner *s, TSLexer *lexer) {
+    bool saw_line_break = false;
+
+    while (!lexer->eof(lexer)) {
+        if (lexer->lookahead == '\n' || lexer->lookahead == '\r') {
+            saw_line_break = true;
+            if (lexer->lookahead == '\r') {
+                advance(s, lexer);
+                if (lexer->lookahead == '\n') {
+                    advance(s, lexer);
+                }
+            } else {
+                advance(s, lexer);
+            }
+        } else if (lexer->lookahead == '$') {
+            advance(s, lexer);
+            if (lexer->lookahead == '$') {
+                return saw_line_break;
+            }
+        } else {
+            advance(s, lexer);
+        }
+    }
+
+    return false;
+}
+
+static bool scan_latex_block_marker(Scanner *s, TSLexer *lexer) {
+    if (lexer->lookahead != '\\' && lexer->lookahead != '$') {
+        return false;
+    }
+
+    if (s->state & STATE_IN_BRACKETED_LATEX_BLOCK) {
+        if (lexer->lookahead == '\\') {
+            advance(s, lexer);
+            if (lexer->lookahead == ']') {
+                s->state &= ~STATE_IN_BRACKETED_LATEX_BLOCK;
+            }
+        }
+        return false;
+    }
+
+    if (s->state & STATE_IN_DOLLAR_LATEX_BLOCK) {
+        if (lexer->lookahead == '$') {
+            advance(s, lexer);
+            if (lexer->lookahead == '$') {
+                s->state &= ~STATE_IN_DOLLAR_LATEX_BLOCK;
+            }
+        }
+        return false;
+    }
+
+    if (lexer->lookahead == '\\') {
+        advance(s, lexer);
+        if (lexer->lookahead == '[') {
+            advance(s, lexer);
+            if (has_multiline_backslash_latex_close(s, lexer)) {
+                s->state |= STATE_IN_BRACKETED_LATEX_BLOCK;
+            }
+        }
+    } else {
+        advance(s, lexer);
+        if (lexer->lookahead == '$') {
+            advance(s, lexer);
+            if (has_multiline_dollar_latex_close(s, lexer)) {
+                s->state |= STATE_IN_DOLLAR_LATEX_BLOCK;
+            }
         }
     }
     return false;
@@ -1363,6 +1467,17 @@ static bool scan(Scanner *s, TSLexer *lexer, const bool *valid_symbols) {
         }
         // Decide which tokens to consider based on the first non-whitespace
         // character
+        if (s->simulate) {
+            if (s->state & STATE_IN_LATEX_BLOCK) {
+                // Lines inside display math stay paragraph continuations even
+                // if they look like Markdown block starts.
+                scan_latex_block_marker(s, lexer);
+                return false;
+            }
+            if (lexer->lookahead == '\\' || lexer->lookahead == '$') {
+                return scan_latex_block_marker(s, lexer);
+            }
+        }
         switch (lexer->lookahead) {
             case '\r':
             case '\n':

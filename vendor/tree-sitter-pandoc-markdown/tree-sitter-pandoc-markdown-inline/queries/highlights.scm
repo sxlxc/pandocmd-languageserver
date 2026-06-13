@@ -7,6 +7,7 @@
 [
   (emphasis_delimiter)
   (code_span_delimiter)
+  (latex_span_delimiter)
 ] @punctuation.delimiter
 
 (emphasis) @text.emphasis

@@ -437,7 +437,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "pandocmd-analysis"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ignore",
  "pandocmd-syntax",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "pandocmd-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "pandocmd-lsp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "lsp-server",
@@ -474,14 +474,14 @@ dependencies = [
 
 [[package]]
 name = "pandocmd-pandoc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "pandocmd-syntax"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror",
  "tree-sitter",

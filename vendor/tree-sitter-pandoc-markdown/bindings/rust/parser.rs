@@ -359,9 +359,50 @@ impl MarkdownParser {
 
 #[cfg(test)]
 mod tests {
-    use tree_sitter::{InputEdit, Point};
+    use tree_sitter::{InputEdit, Point, Query, QueryCursor};
 
     use super::*;
+    use crate::HIGHLIGHT_QUERY_INLINE;
+
+    fn bracketed_latex_after_inline_math() -> &'static str {
+        concat!(
+            "Then the blocks partition the ground set, and for $X\\subseteq W$,\n",
+            "\\[\n",
+            "\\kappa_M\\left(\\bigcup_{w\\in X}T_w,\\ E-\\bigcup_{w\\in X}T_w\\right)\n",
+            "=\n",
+            "\\lambda_M\\left(\\bigcup_{w\\in X}T_w\\right)\n",
+            "=|\\delta_H(X)|.\n",
+            "\\]\n",
+        )
+    }
+
+    fn bracketed_latex_with_markdown_like_lines() -> &'static str {
+        concat!(
+            "Before math\n",
+            "\\[\n",
+            "# not a heading\n",
+            "---\n",
+            "- not a list item\n",
+            "```\n",
+            "=\n",
+            "\\]\n",
+            "After math\n",
+        )
+    }
+
+    fn dollar_latex_with_markdown_like_lines() -> &'static str {
+        concat!(
+            "Before math\n",
+            "$$\n",
+            "# not a heading\n",
+            "---\n",
+            "- not a list item\n",
+            "```\n",
+            "=\n",
+            "$$\n",
+            "After math\n",
+        )
+    }
 
     #[test]
     fn inline_ranges() {
@@ -463,5 +504,138 @@ mod tests {
         assert_eq!(cursor.node().kind(), "pipe_table_cell");
         assert!(cursor.goto_first_child());
         assert_eq!(cursor.node().kind(), "emphasis");
+    }
+
+    #[test]
+    fn parses_bracketed_multiline_latex_after_inline_math() {
+        let code = bracketed_latex_after_inline_math();
+        let mut parser = MarkdownParser::default();
+        let tree = parser.parse(code.as_bytes(), None).unwrap();
+        let inline_sexps = tree
+            .inline_trees()
+            .iter()
+            .map(|inline| inline.root_node().to_sexp())
+            .collect::<Vec<_>>();
+        let latex_block_count = inline_sexps
+            .iter()
+            .map(|sexp| sexp.matches("(latex_block").count())
+            .sum::<usize>();
+        let block_sexp = tree.block_tree().root_node().to_sexp();
+
+        assert!(!tree.block_tree().root_node().has_error(), "{block_sexp}");
+        assert!(!block_sexp.contains("setext_heading"), "{block_sexp}");
+        for sexp in &inline_sexps {
+            assert!(!sexp.contains("ERROR"), "{sexp}");
+        }
+        assert!(
+            latex_block_count >= 2,
+            "expected inline and display math to parse as latex_block nodes: {inline_sexps:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_markdown_block_starts_inside_bracketed_latex() {
+        let code = bracketed_latex_with_markdown_like_lines();
+        let mut parser = MarkdownParser::default();
+        let tree = parser.parse(code.as_bytes(), None).unwrap();
+        let block_sexp = tree.block_tree().root_node().to_sexp();
+        let inline_sexps = tree
+            .inline_trees()
+            .iter()
+            .map(|inline| inline.root_node().to_sexp())
+            .collect::<Vec<_>>();
+
+        assert!(!tree.block_tree().root_node().has_error(), "{block_sexp}");
+        for block_kind in [
+            "atx_heading",
+            "fenced_code_block",
+            "list",
+            "setext_heading",
+            "thematic_break",
+        ] {
+            assert!(
+                !block_sexp.contains(block_kind),
+                "math content was parsed as Markdown block `{block_kind}`: {block_sexp}"
+            );
+        }
+        assert!(
+            inline_sexps
+                .iter()
+                .any(|sexp| sexp.contains("(latex_block")),
+            "expected display math to parse as latex_block: {inline_sexps:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_markdown_block_starts_inside_dollar_latex() {
+        let code = dollar_latex_with_markdown_like_lines();
+        let mut parser = MarkdownParser::default();
+        let tree = parser.parse(code.as_bytes(), None).unwrap();
+        let block_sexp = tree.block_tree().root_node().to_sexp();
+        let inline_sexps = tree
+            .inline_trees()
+            .iter()
+            .map(|inline| inline.root_node().to_sexp())
+            .collect::<Vec<_>>();
+
+        assert!(!tree.block_tree().root_node().has_error(), "{block_sexp}");
+        for block_kind in [
+            "atx_heading",
+            "fenced_code_block",
+            "list",
+            "setext_heading",
+            "thematic_break",
+        ] {
+            assert!(
+                !block_sexp.contains(block_kind),
+                "math content was parsed as Markdown block `{block_kind}`: {block_sexp}"
+            );
+        }
+        assert!(
+            inline_sexps
+                .iter()
+                .any(|sexp| sexp.contains("(latex_block")),
+            "expected display math to parse as latex_block: {inline_sexps:?}"
+        );
+    }
+
+    #[test]
+    fn highlights_bracketed_latex_delimiters() {
+        let code = bracketed_latex_after_inline_math();
+        let mut parser = MarkdownParser::default();
+        let tree = parser.parse(code.as_bytes(), None).unwrap();
+        let inline_sexps = tree
+            .inline_trees()
+            .iter()
+            .map(|inline| inline.root_node().to_sexp())
+            .collect::<Vec<_>>();
+        let block_sexp = tree.block_tree().root_node().to_sexp();
+
+        let language = INLINE_LANGUAGE.into();
+        let query = Query::new(&language, HIGHLIGHT_QUERY_INLINE).unwrap();
+        let mut delimiter_captures = Vec::new();
+
+        for inline in tree.inline_trees() {
+            let mut cursor = QueryCursor::new();
+            delimiter_captures.extend(
+                cursor
+                    .captures(&query, inline.root_node(), code.as_bytes())
+                    .filter_map(|(query_match, capture_index)| {
+                        let capture = query_match.captures[capture_index];
+                        let capture_name = query.capture_names()[capture.index as usize];
+                        (capture_name == "punctuation.delimiter")
+                            .then(|| capture.node.utf8_text(code.as_bytes()).unwrap().to_string())
+                    }),
+            );
+        }
+
+        assert!(
+            delimiter_captures.iter().any(|capture| capture == "\\["),
+            "expected opening display math delimiter capture, got {delimiter_captures:?} in {inline_sexps:?}; block tree: {block_sexp}"
+        );
+        assert!(
+            delimiter_captures.iter().any(|capture| capture == "\\]"),
+            "expected closing display math delimiter capture, got {delimiter_captures:?} in {inline_sexps:?}; block tree: {block_sexp}"
+        );
     }
 }
