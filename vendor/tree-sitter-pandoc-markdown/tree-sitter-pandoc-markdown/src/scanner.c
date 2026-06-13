@@ -173,17 +173,19 @@ static const bool paragraph_interrupt_symbols[] = {
 
 // State bitflags used with `Scanner.state`
 
-// Currently matching (at the beginning of a line)
-static const uint8_t STATE_MATCHING = 0x1 << 0;
-// Last line break was inside a paragraph
-static const uint8_t STATE_WAS_SOFT_LINE_BREAK = 0x1 << 1;
-// Currently inside a Pandoc display math block.
-static const uint8_t STATE_IN_BRACKETED_LATEX_BLOCK = 0x1 << 2;
-static const uint8_t STATE_IN_DOLLAR_LATEX_BLOCK = 0x1 << 3;
-static const uint8_t STATE_IN_LATEX_BLOCK =
-    STATE_IN_BRACKETED_LATEX_BLOCK | STATE_IN_DOLLAR_LATEX_BLOCK;
-// Block should be closed after next line break
-static const uint8_t STATE_CLOSE_BLOCK = 0x1 << 4;
+enum {
+    // Currently matching (at the beginning of a line)
+    STATE_MATCHING = 0x1 << 0,
+    // Last line break was inside a paragraph
+    STATE_WAS_SOFT_LINE_BREAK = 0x1 << 1,
+    // Currently inside a Pandoc display math block.
+    STATE_IN_BRACKETED_LATEX_BLOCK = 0x1 << 2,
+    STATE_IN_DOLLAR_LATEX_BLOCK = 0x1 << 3,
+    STATE_IN_LATEX_BLOCK =
+        STATE_IN_BRACKETED_LATEX_BLOCK | STATE_IN_DOLLAR_LATEX_BLOCK,
+    // Block should be closed after next line break
+    STATE_CLOSE_BLOCK = 0x1 << 4,
+};
 
 static size_t roundup_32(size_t x) {
     x--;
