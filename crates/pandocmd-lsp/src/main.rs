@@ -1386,7 +1386,7 @@ mod tests {
     #[test]
     fn citation_completion_uses_fenced_div_title() -> Result<()> {
         let document =
-            test_document("::: {#thm-main .theorem title=\"Main theorem\"}\n:::\n\nSee [@th]\n")?;
+            test_document("::: {title=\"Main theorem\" #thm-main .theorem}\n:::\n\nSee [@th]\n")?;
         let workspace = WorkspaceIndex::empty();
         let context = citation_completion_context(&document, Position::new(3, 8)).unwrap();
 

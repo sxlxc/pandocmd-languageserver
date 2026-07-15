@@ -1698,6 +1698,7 @@ fn tokenize_attributes(input: &str, offset: usize) -> Vec<AttrToken<'_>> {
     let mut tokens = Vec::new();
     let mut token_start = None;
     let mut quote = None;
+    let mut escaped = false;
 
     for (index, ch) in input.char_indices() {
         if token_start.is_none() {
@@ -1705,6 +1706,16 @@ fn tokenize_attributes(input: &str, offset: usize) -> Vec<AttrToken<'_>> {
                 continue;
             }
             token_start = Some(index);
+        }
+
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
         }
 
         if let Some(active_quote) = quote {
@@ -1936,6 +1947,62 @@ mod tests {
             .diagnostics
             .iter()
             .all(|diagnostic| diagnostic.code != "unresolved-heading"));
+    }
+
+    #[test]
+    fn fenced_div_attributes_are_order_independent() {
+        let attribute_sets = [
+            r#"#prob-mii .problem"#,
+            r#".problem #prob-mii"#,
+            r#"#prob-mii .problem title="MII 5\" theorem""#,
+            r#"#prob-mii title="MII 5\" theorem" .problem"#,
+            r#".problem #prob-mii title="MII 5\" theorem""#,
+            r#".problem title="MII 5\" theorem" #prob-mii"#,
+            r#"title="MII 5\" theorem" #prob-mii .problem"#,
+            r#"title="MII 5\" theorem" .problem #prob-mii"#,
+        ];
+        let mut parser = PandocMarkdownParser::new().unwrap();
+
+        for attributes in attribute_sets {
+            let text = format!(
+                "::: {{{attributes}}}\nA mixed-integer problem.\n:::\n\nSee [@prob-mii].\n"
+            );
+            let document = parser.parse(&text).unwrap();
+            let analysis = DocumentAnalysis::analyze(&document, &WorkspaceIndex::empty());
+
+            assert_eq!(analysis.fenced_divs.len(), 1, "attributes: {attributes}");
+            let div = &analysis.fenced_divs[0];
+            assert_eq!(
+                div.id.as_deref(),
+                Some("prob-mii"),
+                "attributes: {attributes}"
+            );
+            assert_eq!(div.classes, ["problem"], "attributes: {attributes}");
+            assert_eq!(
+                div.title(),
+                attributes
+                    .contains("title=")
+                    .then_some(r#"MII 5\" theorem"#),
+                "attributes: {attributes}"
+            );
+            assert_eq!(
+                &text[div.selection_range.start..div.selection_range.end],
+                "prob-mii",
+                "attributes: {attributes}"
+            );
+            assert!(
+                analysis.local_reference("prob-mii").is_some(),
+                "attributes: {attributes}"
+            );
+            assert!(
+                analysis.diagnostics.iter().all(|diagnostic| !matches!(
+                    diagnostic.code,
+                    "syntax" | "malformed-fenced-div-attributes" | "unresolved-citation"
+                )),
+                "attributes: {attributes}; diagnostics: {:?}",
+                analysis.diagnostics
+            );
+        }
     }
 
     #[test]
