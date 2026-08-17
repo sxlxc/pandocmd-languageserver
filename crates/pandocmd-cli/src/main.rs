@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use pandocmd_analysis::{DocumentAnalysis, WorkspaceIndex};
+use pandocmd_analysis::{AnalyzeOptions, DocumentAnalysis, WorkspaceIndex};
+use pandocmd_extensions::{ExtensionSet, Flavor};
 use pandocmd_pandoc::PandocValidator;
 use pandocmd_syntax::PandocMarkdownParser;
 
@@ -10,6 +11,14 @@ use pandocmd_syntax::PandocMarkdownParser;
 #[command(name = "pandocmd")]
 #[command(about = "Debug tools for the Pandoc Markdown language server")]
 struct Cli {
+    /// Pandoc flavor preset (markdown, gfm, commonmark, ...).
+    #[arg(long, default_value = "markdown")]
+    flavor: String,
+
+    /// Extension diff applied to the flavor, e.g. "+citations-smart".
+    #[arg(long, default_value = "")]
+    extensions: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -19,11 +28,13 @@ enum Command {
     Parse { file: PathBuf },
     Symbols { file: PathBuf },
     Diagnose { file: PathBuf },
+    Extensions,
     Pandoc { file: PathBuf },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let analyze_options = analyze_options(&cli.flavor, &cli.extensions)?;
 
     match cli.command {
         Command::Parse { file } => {
@@ -32,7 +43,7 @@ fn main() -> Result<()> {
         }
         Command::Symbols { file } => {
             let document = parse_file(&file)?;
-            let analysis = DocumentAnalysis::analyze(&document, &WorkspaceIndex::empty());
+            let analysis = analyze(&file, &document, &analyze_options);
             let mut symbols = analysis
                 .headings
                 .iter()
@@ -43,7 +54,7 @@ fn main() -> Result<()> {
                             "{} {} #{}",
                             "#".repeat(heading.level as usize),
                             heading.title,
-                            heading.anchor
+                            heading.anchor.as_deref().unwrap_or("")
                         ),
                     )
                 })
@@ -61,12 +72,7 @@ fn main() -> Result<()> {
         }
         Command::Diagnose { file } => {
             let document = parse_file(&file)?;
-            let base_workspace = file
-                .parent()
-                .map(WorkspaceIndex::from_root)
-                .unwrap_or_else(WorkspaceIndex::empty);
-            let workspace = base_workspace.for_document(Some(&file), document.text());
-            let analysis = DocumentAnalysis::analyze(&document, &workspace);
+            let analysis = analyze(&file, &document, &analyze_options);
             for diagnostic in analysis.diagnostics {
                 let (start, _) = document
                     .line_index()
@@ -78,6 +84,33 @@ fn main() -> Result<()> {
                     diagnostic.message,
                     diagnostic.code
                 );
+            }
+        }
+        Command::Extensions => {
+            println!("{:<32} {:<8} DESCRIPTION", "EXTENSION", "DEFAULT");
+            for flavor in [
+                Flavor::Markdown,
+                Flavor::Gfm,
+                Flavor::CommonMark,
+                Flavor::CommonMarkX,
+                Flavor::MarkdownStrict,
+                Flavor::MarkdownMmd,
+                Flavor::MarkdownPhpextra,
+            ] {
+                let defaults = ExtensionSet::flavor_defaults(flavor);
+                println!("\n[{}]", flavor.name());
+                for extension in pandocmd_extensions::Extension::ALL {
+                    println!(
+                        "{:<32} {:<8} {}",
+                        extension.name(),
+                        if defaults.contains(*extension) {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                        extension.description()
+                    );
+                }
             }
         }
         Command::Pandoc { file } => {
@@ -95,7 +128,30 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_file(file: &PathBuf) -> Result<pandocmd_syntax::ParsedDocument> {
+fn analyze_options(flavor: &str, diff: &str) -> Result<AnalyzeOptions> {
+    let spec = format!("{flavor}{diff}");
+    let parsed = pandocmd_extensions::parse_format_spec(&spec)?;
+    Ok(AnalyzeOptions::with_extensions(parsed.extensions))
+}
+
+fn analyze(
+    file: &std::path::Path,
+    document: &pandocmd_syntax::ParsedDocument,
+    options: &AnalyzeOptions,
+) -> DocumentAnalysis {
+    let base_workspace = file
+        .parent()
+        .map(WorkspaceIndex::from_root)
+        .unwrap_or_else(WorkspaceIndex::empty);
+    let workspace = base_workspace.for_document_with_extensions(
+        Some(file),
+        document.text(),
+        options.extensions,
+    );
+    DocumentAnalysis::analyze(document, &workspace, options)
+}
+
+fn parse_file(file: &std::path::Path) -> Result<pandocmd_syntax::ParsedDocument> {
     let text = std::fs::read_to_string(file)
         .with_context(|| format!("failed to read {}", file.display()))?;
     let mut parser = PandocMarkdownParser::new()?;
