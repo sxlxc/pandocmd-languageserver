@@ -24,13 +24,14 @@ const FIXTURE: &str = concat!(
 fn analyze_fixture() -> DocumentAnalysis {
     let text = std::fs::read_to_string(FIXTURE).unwrap();
     let mut parser = PandocMarkdownParser::new().unwrap();
-    let document = parser.parse(text.clone()).unwrap();
-    let fixtures_dir = Path::new(FIXTURE).parent().unwrap();
-    let workspace = WorkspaceIndex::from_root(fixtures_dir).for_document_with_extensions(
-        Some(Path::new(FIXTURE)),
-        &text,
-        pandocmd_extensions::ExtensionSet::flavor_defaults(Flavor::Markdown),
-    );
+    let document = parser.parse(text).unwrap();
+    let fixture_path = Path::new(FIXTURE);
+    let workspace = WorkspaceIndex::from_root(fixture_path.parent().unwrap())
+        .for_document_with_extensions(
+            Some(fixture_path),
+            document.text(),
+            pandocmd_extensions::ExtensionSet::flavor_defaults(Flavor::Markdown),
+        );
     DocumentAnalysis::analyze(&document, &workspace, &AnalyzeOptions::default())
 }
 
