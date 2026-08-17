@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/pandocmd-analysis",
+    "crates/pandocmd-extensions",
     "crates/pandocmd-cli",
     "crates/pandocmd-lsp",
     "crates/pandocmd-pandoc",
@@ -16,11 +17,13 @@ rust-version = "1.82"
 
 [workspace.dependencies]
 anyhow = "1.0"
+crossbeam-channel = "0.5"
 clap = { version = "4.5", features = ["derive"] }
 ignore = "0.4"
 lsp-server = "0.7"
 lsp-types = "0.94"
 pandocmd-analysis = { path = "crates/pandocmd-analysis" }
+pandocmd-extensions = { path = "crates/pandocmd-extensions" }
 pandocmd-pandoc = { path = "crates/pandocmd-pandoc" }
 pandocmd-syntax = { path = "crates/pandocmd-syntax" }
 regex = "1.10"
