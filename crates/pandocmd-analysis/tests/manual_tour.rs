@@ -24,25 +24,23 @@ const FIXTURE: &str = concat!(
 fn analyze_fixture() -> DocumentAnalysis {
     let text = std::fs::read_to_string(FIXTURE).unwrap();
     let mut parser = PandocMarkdownParser::new().unwrap();
-    let document = parser.parse(text).unwrap();
-    let workspace = WorkspaceIndex::empty();
+    let document = parser.parse(text.clone()).unwrap();
+    let fixtures_dir = Path::new(FIXTURE).parent().unwrap();
+    let workspace = WorkspaceIndex::from_root(fixtures_dir).for_document_with_extensions(
+        Some(Path::new(FIXTURE)),
+        &text,
+        pandocmd_extensions::ExtensionSet::flavor_defaults(Flavor::Markdown),
+    );
     DocumentAnalysis::analyze(&document, &workspace, &AnalyzeOptions::default())
 }
 
 #[test]
 fn tour_fixture_has_no_diagnostics() {
     let analysis = analyze_fixture();
-    let diagnostics: Vec<&pandocmd_analysis::Diagnostic> = analysis
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.code != "unresolved-citation")
-        .collect();
-    // The fixture bibliography lives next to it but the empty workspace has
-    // no keys, so unresolved-citation is filtered; everything else must be
-    // silent.
     assert!(
-        diagnostics.is_empty(),
-        "unexpected diagnostics: {diagnostics:#?}"
+        analysis.diagnostics.is_empty(),
+        "unexpected diagnostics: {:#?}",
+        analysis.diagnostics
     );
 }
 

@@ -703,6 +703,16 @@ impl<'a> ScanState<'a> {
         for captures in CITATION_RE.captures_iter(&masked) {
             let sigil = captures.get(2).unwrap();
             let key = captures.get(3).unwrap();
+            // `(@label)` is an example-list reference, not a citation.
+            let is_example_reference = masked
+                .get(..sigil.start())
+                .is_some_and(|prefix| prefix.ends_with('('))
+                && masked
+                    .get(key.end()..)
+                    .is_some_and(|suffix| suffix.starts_with(')'));
+            if is_example_reference {
+                continue;
+            }
             let key_range = TextRange::new(byte_offset + key.start(), byte_offset + key.end());
             if citations_on {
                 self.push_semantic_token(
