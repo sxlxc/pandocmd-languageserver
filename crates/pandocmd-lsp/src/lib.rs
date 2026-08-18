@@ -10,7 +10,7 @@
 //! the current process's stdio, while [`Server`] can be driven over any
 //! [`lsp_server::Connection`] (see the integration tests).
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::notification::{
     DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
@@ -18,17 +18,18 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentLinkRequest,
-    DocumentSymbolRequest, FoldingRangeRequest, GotoDefinition, HoverRequest, PrepareRenameRequest,
-    References, Rename as RenameRequest, Request as _, SemanticTokensFullRequest,
+    DocumentSymbolRequest, ExecuteCommand as ExecuteCommandRequest, FoldingRangeRequest,
+    GotoDefinition, HoverRequest, PrepareRenameRequest, References, Rename as RenameRequest,
+    Request as _, SemanticTokensFullRequest,
 };
 use lsp_types::{
     CodeActionContext, CompletionOptions, Diagnostic, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
-    InitializeParams, Location, OneOf, Position, PublishDiagnosticsParams, RenameParams,
-    SaveOptions, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
-    WorkspaceEdit,
+    DocumentSymbolResponse, ExecuteCommandParams, FoldingRange, FoldingRangeParams,
+    FoldingRangeProviderCapability, InitializeParams, Location, OneOf, Position,
+    PublishDiagnosticsParams, RenameParams, SaveOptions, ServerCapabilities, ShowMessageParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkspaceEdit,
 };
 use pandocmd_analysis::{AnalyzeOptions, WorkspaceIndex};
 use pandocmd_pandoc::PandocValidator;
@@ -45,6 +46,15 @@ use document::OpenDocument;
 
 /// Semantic token legend advertised by the server.
 pub const SEMANTIC_TOKENS_LEGEND: &[&str] = features::SEMANTIC_TOKEN_LEGEND;
+
+/// The command surfaced by the "enable extension" code action.
+///
+/// Clients that support editor-side settings (VS Code style) may intercept
+/// `workspace/executeCommand` and persist the change in user settings; every
+/// other client (Zed, Neovim, plain LSP) just forwards the request back, so
+/// the server also handles it itself and enables the extension for the
+/// current session.
+pub const ENABLE_EXTENSION_COMMAND: &str = "pandocmd.enableExtension";
 
 /// Run the language server over stdio (the binary entrypoint).
 pub fn run_stdio() -> Result<()> {
@@ -117,6 +127,10 @@ fn server_capabilities() -> ServerCapabilities {
             ),
         ),
         code_action_provider: Some(lsp_types::CodeActionProviderCapability::Simple(true)),
+        execute_command_provider: Some(lsp_types::ExecuteCommandOptions {
+            commands: vec![ENABLE_EXTENSION_COMMAND.to_string()],
+            work_done_progress_options: Default::default(),
+        }),
         rename_provider: Some(lsp_types::OneOf::Right(lsp_types::RenameOptions {
             prepare_provider: Some(true),
             work_done_progress_options: Default::default(),
@@ -313,6 +327,9 @@ impl Server {
             }
             RenameRequest::METHOD => self.rename(request.params).and_then(to_value),
             PrepareRenameRequest::METHOD => self.prepare_rename(request.params).and_then(to_value),
+            ExecuteCommandRequest::METHOD => {
+                self.execute_command(request.params).and_then(to_value)
+            }
             _ => {
                 return Response::new_err(
                     id,
@@ -422,6 +439,56 @@ impl Server {
         }
         // Some clients only push empty settings; poll as a fallback.
         self.pull_workspace_configuration();
+    }
+
+    // ------------------------------------------------------- client commands
+
+    fn execute_command(&mut self, params: serde_json::Value) -> Result<Option<serde_json::Value>> {
+        let params: ExecuteCommandParams = serde_json::from_value(params)?;
+        match params.command.as_str() {
+            ENABLE_EXTENSION_COMMAND => {
+                let name = params
+                    .arguments
+                    .first()
+                    .and_then(|argument| argument.get("extension"))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .with_context(|| {
+                        format!(
+                            "{ENABLE_EXTENSION_COMMAND} expects arguments like \
+                             {{\"extension\": \"citations\"}}"
+                        )
+                    })?;
+                self.enable_extension(name);
+                Ok(None)
+            }
+            other => bail!("unknown command: {other}"),
+        }
+    }
+
+    /// Enable a Pandoc extension for this session, re-analyze every open
+    /// document, and tell the user how to make the change permanent.
+    fn enable_extension(&mut self, name: &str) {
+        let section = self.config.extensions.get_or_insert_with(Default::default);
+        section.disabled.retain(|disabled| disabled != name);
+        if !section.enabled.iter().any(|enabled| enabled == name) {
+            section.enabled.push(name.to_string());
+        }
+        self.apply_config(PandocmdConfig::default());
+
+        let notification = Notification::new(
+            "window/showMessage".to_string(),
+            ShowMessageParams {
+                typ: lsp_types::MessageType::INFO,
+                message: format!(
+                    "Enabled the `{name}` Pandoc extension for this session. \
+                     To keep it enabled, add \"{name}\" to `extensions.enabled` \
+                     in the pandocmd language-server settings."
+                ),
+            },
+        );
+        let _ = self.sender.send(Message::Notification(notification));
     }
 
     // ------------------------------------------------------ document events

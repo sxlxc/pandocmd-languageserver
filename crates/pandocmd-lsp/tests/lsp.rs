@@ -545,6 +545,57 @@ fn code_actions_offer_extension_enablement() {
 }
 
 #[test]
+fn execute_command_enables_extension() {
+    let uri = test_uri("execute-command");
+    let mut client = TestClient::start(Some(json!({
+        "extensions": { "disabled": ["citations"] }
+    })));
+    client.open(&uri, "See [@doe2024].\n");
+
+    let before = codes(&client.diagnostics_for(&uri));
+    assert!(
+        before.iter().any(|code| code == "extension-disabled"),
+        "expected an extension-disabled diagnostic first, got {before:?}"
+    );
+
+    let response = client.request_raw(
+        "workspace/executeCommand",
+        json!({
+            "command": "pandocmd.enableExtension",
+            "arguments": [{ "extension": "citations" }],
+        }),
+    );
+    assert!(response.error.is_none(), "{:?}", response.error);
+
+    let after = codes(&client.diagnostics_for(&uri));
+    assert!(
+        !after.iter().any(|code| code == "extension-disabled"),
+        "extension-disabled diagnostics must clear after the command, got {after:?}"
+    );
+    assert!(client.notifications.iter().any(|params| params
+        .get("message")
+        .and_then(|message| message.as_str())
+        .is_some_and(|message| message.contains("citations"))));
+}
+
+#[test]
+fn execute_command_rejects_unknown_command_and_arguments() {
+    let mut client = TestClient::start(None);
+
+    let response = client.request_raw(
+        "workspace/executeCommand",
+        json!({ "command": "pandocmd.bogus" }),
+    );
+    assert!(response.error.is_some());
+
+    let response = client.request_raw(
+        "workspace/executeCommand",
+        json!({ "command": "pandocmd.enableExtension", "arguments": [] }),
+    );
+    assert!(response.error.is_some());
+}
+
+#[test]
 fn rename_updates_definitions_and_references() {
     let uri = test_uri("rename");
     let mut client = TestClient::start(None);

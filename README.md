@@ -67,14 +67,16 @@ rejected so typos surface quickly.
 
 ### Zed integration
 
-The server binary speaks LSP over stdio. In a Zed extension's
-`extension.toml` / Zed settings, point the language server at the
-`pandocmd-lsp` binary and pass settings through `initializationOptions`:
+The server binary speaks LSP over stdio. In the `zed-pandoc-markdown`
+extension it runs under the `pandocmd` server id, and settings can be passed
+through `lsp.pandocmd.settings` (the extension nests a bare configuration
+object under the `pandoc` section automatically) or through
+`lsp.pandocmd.initialization_options`:
 
 ```json
 {
   "lsp": {
-    "pandoc-markdown": {
+    "pandocmd": {
       "settings": {
         "extensions": { "flavor": "markdown", "disabled": ["smart"] },
         "diagnostics": { "pandoc": "onSave" }
@@ -84,11 +86,16 @@ The server binary speaks LSP over stdio. In a Zed extension's
 }
 ```
 
-The server declares one client-side command,
+The server declares one command,
 `pandocmd.enableExtension` (argument: `{ "extension": "name" }`), surfaced by
-the "Enable the `x` extension" code action. Extensions can implement it by
-updating the user's language settings and sending
-`workspace/didChangeConfiguration`.
+the "Enable the `x` extension" code action and advertised via
+`executeCommandProvider`. Clients that manage user settings themselves
+(e.g. a VS Code extension) may intercept the `workspace/executeCommand`
+request, persist the change in settings, and push it back via
+`workspace/didChangeConfiguration`. Clients that simply forward the request
+back to the server (Zed, Neovim) get a session-local fallback: the server
+enables the extension in memory, re-analyzes every open document, and shows
+an informational message explaining how to make the change permanent.
 
 ### Extension names
 
