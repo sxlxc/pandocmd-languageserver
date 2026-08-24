@@ -479,6 +479,91 @@ fn disabled_math_constructs_warn_but_currency_does_not() {
 }
 
 #[test]
+fn multiline_dollar_math_block_is_opaque_and_highlighted() {
+    let analysis = analyze("$$\n[a](b) and [label]\n$$\n");
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "brackets inside display math must not become references: {:?}",
+        codes(&analysis)
+    );
+    assert!(analysis.reference_links.is_empty());
+    let math_tokens: Vec<_> = analysis
+        .semantic_tokens
+        .iter()
+        .filter(|token| token.kind.name() == "math")
+        .collect();
+    assert_eq!(math_tokens.len(), 1);
+    assert_eq!(math_tokens[0].range.start, 0);
+    // `$$\n` + `[a](b) and [label]\n` + `$$` = 2 + 1 + 18 + 1 + 2 bytes.
+    assert_eq!(math_tokens[0].range.end, 24);
+}
+
+#[test]
+fn multiline_backslash_math_block_needs_the_extension() {
+    let options = AnalyzeOptions::with_extensions(
+        markdown_extensions().enable(Extension::TexMathSingleBackslash),
+    );
+    let analysis = analyze_with("\\[\nx = [y]\n\\]\n", options);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "expected no diagnostics: {:?}",
+        codes(&analysis)
+    );
+    assert_eq!(
+        analysis
+            .semantic_tokens
+            .iter()
+            .filter(|token| token.kind.name() == "math")
+            .count(),
+        1
+    );
+
+    // Without the extension the opener is hinted and the content falls
+    // back to prose, where `[y]` is an unresolved shortcut reference
+    // (pandoc warns the same way).
+    let disabled = analyze("\\[\nx = [y]\n\\]\n");
+    assert_eq!(
+        disabled_for(&disabled, Extension::TexMathSingleBackslash),
+        1
+    );
+    assert!(codes(&disabled).contains(&"unresolved-reference"));
+}
+
+#[test]
+fn inline_math_hides_brackets_from_reference_scanners() {
+    let analysis = analyze("Graph $j$-cut is $W[1]$-hard and $a \\subseteq b$.\n");
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "math brackets must not warn: {:?}",
+        codes(&analysis)
+    );
+    assert!(analysis.reference_links.is_empty());
+    // Currency-looking dollar spans stay prose and never warn.
+    let currency = analyze("Costs $5 and $6, times $7.50.\n");
+    assert!(currency.diagnostics.is_empty());
+    assert_eq!(
+        currency
+            .semantic_tokens
+            .iter()
+            .filter(|token| token.kind.name() == "math")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn display_math_closer_may_carry_attributes() {
+    let analysis = analyze("$$\nx = y\n$$ {#eq-x}\n\n## Next\n");
+    assert_eq!(analysis.headings.len(), 1, "heading after math block");
+    assert!(analysis.local_references.iter().any(|r| r.id == "eq-x"));
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "expected no diagnostics: {:?}",
+        codes(&analysis)
+    );
+}
+
+#[test]
 fn disabled_tables_warn() {
     let options = AnalyzeOptions::with_extensions(
         markdown_extensions()

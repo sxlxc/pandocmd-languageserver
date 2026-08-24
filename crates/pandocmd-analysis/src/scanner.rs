@@ -151,6 +151,7 @@ struct ScanState<'a> {
     div_stack: Vec<OpenDiv>,
     anchor_counts: HashMap<String, usize>,
     code_fence: Option<CodeFence>,
+    math_block: Option<MathBlock>,
     in_metadata: bool,
     metadata_seen: bool,
     previous_was_paragraph: bool,
@@ -228,6 +229,24 @@ struct CodeFence {
     length: usize,
 }
 
+/// An open multi-line display math block: `$$` … `$$` (tex_math_dollars)
+/// or `\[` … `\]` (tex_math_single_backslash / tex_math_double_backslash).
+/// While open, every other construct on the enclosed lines is hidden, like
+/// fenced code content.
+#[derive(Debug, Clone, Copy)]
+struct MathBlock {
+    kind: MathBlockKind,
+    start: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MathBlockKind {
+    /// Delimited by `$$` on the opening and closing lines.
+    Dollars,
+    /// Delimited by `\[` … `\]`.
+    Bracket,
+}
+
 #[derive(Debug)]
 struct OpenDiv {
     index: usize,
@@ -247,6 +266,7 @@ impl<'a> ScanState<'a> {
             div_stack: Vec::new(),
             anchor_counts: HashMap::new(),
             code_fence: None,
+            math_block: None,
             in_metadata: false,
             metadata_seen: false,
             previous_was_paragraph: false,
@@ -469,6 +489,81 @@ impl<'a> ScanState<'a> {
             return;
         }
 
+        // A multi-line display math block (`$$` … `$$` or `\[` … `\]`)
+        // hides every other construct on the enclosed lines, like fenced
+        // code content.
+        if let Some(math) = self.math_block {
+            // The closing delimiter may carry trailing content (attributes
+            // such as `$$ {#eq-1}`), and math content can never contain the
+            // delimiter itself, so any occurrence closes the block.
+            let closed = match math.kind {
+                MathBlockKind::Dollars => line.contains("$$"),
+                MathBlockKind::Bracket => line.contains("\\]"),
+            };
+            if closed {
+                self.push_semantic_token(
+                    SemanticTokenKind::Math,
+                    TextRange::new(math.start, byte_offset + line.len()),
+                );
+                self.math_block = None;
+                // Trailing `{#eq-x}` attributes after the closing delimiter
+                // define a local reference target, like fenced code
+                // attributes.
+                self.scan_braced_attribute_references(line, byte_offset);
+            }
+            self.previous_was_paragraph = false;
+            self.pending_paragraph.clear();
+            self.after_blank = false;
+            return;
+        }
+
+        // Display math openers that start a multi-line block. A span that
+        // closes on the same line is handled by the per-line regexes.
+        if line.trim_start().starts_with("$$") && !DISPLAY_MATH_RE.is_match(line) {
+            let start = byte_offset + line.find("$$").unwrap_or(0);
+            if self.extensions.contains(Extension::TexMathDollars) {
+                self.math_block = Some(MathBlock {
+                    kind: MathBlockKind::Dollars,
+                    start,
+                });
+                self.previous_was_paragraph = false;
+                self.pending_paragraph.clear();
+                self.after_blank = false;
+                return;
+            }
+            if self.options.disabled_extensions {
+                self.push_disabled_diagnostic(
+                    Extension::TexMathDollars,
+                    TextRange::new(start, start + 2),
+                    Severity::Hint,
+                    "TeX math with $$..$$ is disabled",
+                );
+            }
+        }
+        if line.trim_start().starts_with("\\[") && !MATH_BACKSLASH_RE.is_match(line) {
+            let start = byte_offset + line.find("\\[").unwrap_or(0);
+            if self.extensions.contains(Extension::TexMathSingleBackslash)
+                || self.extensions.contains(Extension::TexMathDoubleBackslash)
+            {
+                self.math_block = Some(MathBlock {
+                    kind: MathBlockKind::Bracket,
+                    start,
+                });
+                self.previous_was_paragraph = false;
+                self.pending_paragraph.clear();
+                self.after_blank = false;
+                return;
+            }
+            if self.options.disabled_extensions {
+                self.push_disabled_diagnostic(
+                    Extension::TexMathSingleBackslash,
+                    TextRange::new(start, start + 2),
+                    Severity::Hint,
+                    "TeX math with \\[..\\] is disabled",
+                );
+            }
+        }
+
         // Grid tables: `+---+` rules start one, `| ... |` lines are rows
         // whose cells can contain block content (headings, code cells).
         if GRID_RULE_RE.is_match(line) {
@@ -498,6 +593,14 @@ impl<'a> ScanState<'a> {
             let mut row_masked = masked.clone().into_bytes();
             self.scan_grid_row_cells(line, byte_offset, &masked, &mut row_masked);
             masked = String::from_utf8(row_masked).expect("row mask is valid UTF-8");
+        }
+        // Inline math spans are highlighted and blanked out of the text the
+        // inline scanners see, so brackets and `@keys` inside math are not
+        // mistaken for links and citations. `math_visible` (math intact) is
+        // kept for the disabled-extension hints.
+        let math_visible = masked.clone();
+        if math_visible.contains('$') || math_visible.contains('\\') {
+            masked = self.mask_math_spans(&math_visible, line, byte_offset);
         }
         // Inline scanners see the virtual text that joins any link-text
         // carry from the previous line, so wrapped reference links are found.
@@ -591,7 +694,7 @@ impl<'a> ScanState<'a> {
         self.scan_div_line(line, byte_offset);
         self.scan_block_line(line, &masked, byte_offset);
         self.scan_inline_line(&inline_text, &inline_raw, line, byte_offset, inline_base);
-        self.scan_disabled_inline(line, &masked, byte_offset);
+        self.scan_disabled_inline(line, &math_visible, byte_offset);
         self.scan_links_with_carry(line, byte_offset, carried, &masked, line);
 
         self.previous_was_paragraph = !line.trim().is_empty()
@@ -728,6 +831,14 @@ impl<'a> ScanState<'a> {
 
     fn finish(&mut self, document_len: usize) {
         self.finish_unclosed_fenced_divs(document_len);
+        if let Some(math) = self.math_block.take() {
+            // Pandoc extends an unclosed math block to the end of the
+            // document; highlight it the same way, without a diagnostic.
+            self.push_semantic_token(
+                SemanticTokenKind::Math,
+                TextRange::new(math.start, document_len),
+            );
+        }
         if let Some(pending) = self.pending_ref_def.take() {
             // A `[label]:` at end of document never got its target line.
             self.push_reference_definition(pending, String::new(), None);
@@ -1228,18 +1339,6 @@ impl<'a> ScanState<'a> {
             }
         }
 
-        if self.extensions.contains(Extension::TexMathDollars) {
-            for regex in [DISPLAY_MATH_RE.clone(), INLINE_MATH_RE.clone()] {
-                for captures in regex.captures_iter(masked) {
-                    let whole = captures.get(0).unwrap();
-                    self.push_semantic_token(
-                        SemanticTokenKind::Math,
-                        TextRange::new(inline_base + whole.start(), inline_base + whole.end()),
-                    );
-                }
-            }
-        }
-
         self.scan_braced_attribute_references(line, byte_offset);
     }
 
@@ -1712,17 +1811,7 @@ impl<'a> ScanState<'a> {
             for captures in INLINE_MATH_RE.captures_iter(masked) {
                 let whole = captures.get(0).unwrap();
                 let content = captures.get(1).unwrap().as_str();
-                let mathish = if content.contains(' ') {
-                    // Spaced content must contain strong math markers; a
-                    // lone backslash also occurs in prose.
-                    content.contains(['^', '_', '{', '}'])
-                } else {
-                    !content.contains('`')
-                };
-                let currency_like = content
-                    .chars()
-                    .all(|ch| ch.is_ascii_digit() || ch == ',' || ch == '.');
-                if mathish && !currency_like {
+                if inline_mathish(content) {
                     self.push_disabled_diagnostic(
                         Extension::TexMathDollars,
                         TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
@@ -1850,6 +1939,71 @@ impl<'a> ScanState<'a> {
             .analysis
             .semantic_tokens
             .push(SemanticToken { kind, range });
+    }
+
+    /// Emit `math` semantic tokens for the inline math spans on a line and
+    /// return the line with those spans blanked out, so the inline scanners
+    /// (links, citations, labels) do not interpret math content as
+    /// Markdown. `line` is the code-masked text; `raw` is the original line
+    /// (same byte length), needed for GFM math whose backticks are already
+    /// hidden in `line`.
+    fn mask_math_spans(&mut self, line: &str, raw: &str, byte_offset: usize) -> String {
+        fn blank(bytes: &mut [u8], start: usize, end: usize) {
+            if let Some(slice) = bytes.get_mut(start..end) {
+                for byte in slice {
+                    *byte = b' ';
+                }
+            }
+        }
+        let mut blanked = line.as_bytes().to_vec();
+        if self.extensions.contains(Extension::TexMathDollars) {
+            for captures in DISPLAY_MATH_RE.captures_iter(line) {
+                let whole = captures.get(0).unwrap();
+                self.push_semantic_token(
+                    SemanticTokenKind::Math,
+                    TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+                );
+                blank(&mut blanked, whole.start(), whole.end());
+            }
+            // Single dollars: after `$$..$$` is blanked, so an inline span
+            // cannot nest inside a display span. Currency-looking spans
+            // ("$5 and $6") stay visible to the scanners.
+            let dollars_masked = String::from_utf8_lossy(&blanked).into_owned();
+            for captures in INLINE_MATH_RE.captures_iter(&dollars_masked) {
+                let whole = captures.get(0).unwrap();
+                if !inline_mathish(captures.get(1).unwrap().as_str()) {
+                    continue;
+                }
+                self.push_semantic_token(
+                    SemanticTokenKind::Math,
+                    TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+                );
+                blank(&mut blanked, whole.start(), whole.end());
+            }
+        }
+        if self.extensions.contains(Extension::TexMathSingleBackslash)
+            || self.extensions.contains(Extension::TexMathDoubleBackslash)
+        {
+            for captures in MATH_BACKSLASH_RE.captures_iter(line) {
+                let whole = captures.get(0).unwrap();
+                self.push_semantic_token(
+                    SemanticTokenKind::Math,
+                    TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+                );
+                blank(&mut blanked, whole.start(), whole.end());
+            }
+        }
+        if self.extensions.contains(Extension::TexMathGfm) {
+            for captures in MATH_GFM_RE.captures_iter(raw) {
+                let whole = captures.get(0).unwrap();
+                self.push_semantic_token(
+                    SemanticTokenKind::Math,
+                    TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+                );
+                blank(&mut blanked, whole.start(), whole.end());
+            }
+        }
+        String::from_utf8(blanked).expect("mask is valid UTF-8")
     }
 }
 
@@ -2106,6 +2260,35 @@ fn inside_inline_code(masked: &str, position: usize) -> bool {
         .get(position)
         .is_some_and(|byte| *byte == b' ')
         && position < masked.len()
+}
+
+/// Heuristic filter for `$..$` spans: tight, math-looking content is math,
+/// while spans like "$5 and $6" or "$5" are prose about currency.
+fn inline_mathish(content: &str) -> bool {
+    let mathish = if content.contains(' ') {
+        // Spaced content must contain strong math markers; LaTeX commands
+        // (`\subseteq`) count, but punctuation escapes like `\(` alone
+        // also occur in prose.
+        content.contains(['^', '_', '{', '}']) || contains_latex_command(content)
+    } else {
+        !content.contains('`')
+    };
+    let currency_like = content
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || ch == ',' || ch == '.');
+    mathish && !currency_like
+}
+
+/// True when the text contains a LaTeX command (backslash followed by a
+/// letter, like `\subseteq`).
+fn contains_latex_command(content: &str) -> bool {
+    content.char_indices().any(|(index, ch)| {
+        ch == '\\'
+            && content[index + 1..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_alphabetic())
+    })
 }
 
 /// If the masked text ends inside an unclosed `[`, return the offset and
