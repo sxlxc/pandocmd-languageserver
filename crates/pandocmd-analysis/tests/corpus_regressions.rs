@@ -445,8 +445,8 @@ fn reference_continuation_takes_the_whole_next_line() {
 fn continuation_targets_report_their_own_range() {
     // The documentLink region of a continuation definition is the target
     // line, not the label line.
-    let analysis = analyze("[ref]:\n  https://example.com/continued \"Title\"\n");
     let text = "[ref]:\n  https://example.com/continued \"Title\"\n";
+    let analysis = analyze(text);
     let link = analysis
         .links
         .iter()

@@ -34,8 +34,6 @@ static TABLE_RULE_RE: LazyLock<Regex> =
 /// Definition-list definition marker (`:`, `::`, or `~` followed by space).
 static DEF_LIST_MARKER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[ \t]*(:{1,2}|~)[ \t]+([^ \t]*)").unwrap());
-/// The target (and optional title) continuation line of a reference
-/// definition whose URL is on a following line.
 /// A reference-definition continuation line that carries a trailing link
 /// title: `<target> "title"` / `<target> 'title'` / `<target> (title)`.
 static REF_DEF_CONTINUATION_TITLE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -317,9 +315,8 @@ impl<'a> ScanState<'a> {
             }
             self.previous_was_paragraph = false;
             self.pending_paragraph.clear();
-            // A pending `[label]:` keeps waiting across blank lines only in
-            // the sense that pandoc never takes a URL after a blank: close
-            // it with an empty target.
+            // A pending `[label]:` never finds its URL after a blank
+            // line; pandoc closes it with an empty target.
             if let Some(pending) = self.pending_ref_def.take() {
                 self.push_reference_definition(pending, String::new(), None);
             }
@@ -509,16 +506,7 @@ impl<'a> ScanState<'a> {
         let inline_base;
         match &carried {
             Some((carry_offset, carry_strict, carry_raw)) => {
-                // The joiner occupies exactly the bytes between the carried
-                // text and this line (the newline, or CRLF), so every offset
-                // in the joined text is an exact document offset. Pandoc
-                // renders the wrap as a single space; whitespace collapses
-                // during label normalization.
-                let joiner = " ".repeat(
-                    byte_offset
-                        .saturating_sub(carry_offset + carry_strict.len())
-                        .max(1),
-                );
+                let joiner = wrap_joiner(carry_offset + carry_strict.len(), byte_offset);
                 inline_text = format!("{carry_strict}{joiner}{masked}");
                 inline_raw = format!("{carry_raw}{joiner}{line}");
                 inline_base = *carry_offset;
@@ -635,7 +623,6 @@ impl<'a> ScanState<'a> {
         if self.pending_ref_title {
             self.pending_ref_title = false;
             if REF_DEF_TITLE_RE.is_match(line) {
-                let _ = byte_offset;
                 return true;
             }
         }
@@ -854,9 +841,7 @@ impl<'a> ScanState<'a> {
                 .as_str()
                 .trim()
                 .trim_start_matches('<')
-                .trim_end_matches('>')
-                .to_string();
-            let target_text = target_text.as_str();
+                .trim_end_matches('>');
             let target_offset = if target.as_str().starts_with('<') {
                 target.start() + 1
             } else {
@@ -1360,13 +1345,7 @@ impl<'a> ScanState<'a> {
         let scan_base;
         match &carried {
             Some((carry_offset, carry_strict, carry_raw)) => {
-                // The joiner occupies exactly the newline bytes between the
-                // carried text and this line, keeping offsets exact.
-                let joiner = " ".repeat(
-                    byte_offset
-                        .saturating_sub(carry_offset + carry_strict.len())
-                        .max(1),
-                );
+                let joiner = wrap_joiner(carry_offset + carry_strict.len(), byte_offset);
                 virtual_text = format!("{carry_strict}{joiner}{masked}");
                 virtual_raw = format!("{carry_raw}{joiner}{raw_line}");
                 scan_base = *carry_offset;
@@ -2033,34 +2012,39 @@ fn continuation_target(line: &str, byte_offset: usize) -> (String, Option<TextRa
     if let Some(captures) = REF_DEF_CONTINUATION_TITLE_RE.captures(line) {
         let head = captures.get(1).unwrap();
         let trimmed = head.as_str().trim_end();
-        let (text, range) = angle_target_with_range(
-            trimmed,
-            byte_offset + head.start() + (head.as_str().len() - trimmed.len()),
-        );
-        return (text, range, true);
+        let trailing_ws = head.as_str().len() - trimmed.len();
+        let (text, range) =
+            angle_target_with_range(trimmed, byte_offset + head.start() + trailing_ws);
+        return (text, Some(range), true);
     }
     let trimmed = line.trim();
     let lead = line.len() - line.trim_start().len();
     let (text, range) = angle_target_with_range(trimmed, byte_offset + lead);
-    (text, range, false)
+    (text, Some(range), false)
 }
 
 /// Strip optional angle brackets from a target while reporting the range of
 /// the destination text itself.
-fn angle_target_with_range(text: &str, start: usize) -> (String, Option<TextRange>) {
+fn angle_target_with_range(text: &str, start: usize) -> (String, TextRange) {
     let inner = text
         .strip_prefix('<')
         .and_then(|rest| rest.strip_suffix('>'));
     match inner {
         Some(inner) => (
             inner.to_string(),
-            Some(TextRange::new(start + 1, start + 1 + inner.len())),
+            TextRange::new(start + 1, start + 1 + inner.len()),
         ),
-        None => (
-            text.to_string(),
-            Some(TextRange::new(start, start + text.len())),
-        ),
+        None => (text.to_string(), TextRange::new(start, start + text.len())),
     }
+}
+
+/// The joiner between text carried over from the previous line (ending at
+/// byte `carry_end`) and the current line at `line_offset`: it occupies
+/// exactly the bytes between them (the newline, or CRLF), so every offset in
+/// the joined text is an exact document offset. Never shorter than one
+/// space, so the wrap is still visible as whitespace.
+fn wrap_joiner(carry_end: usize, line_offset: usize) -> String {
+    " ".repeat(line_offset.saturating_sub(carry_end).max(1))
 }
 
 /// A grid-table rule line (`+---+---+`, `+===+===+`).

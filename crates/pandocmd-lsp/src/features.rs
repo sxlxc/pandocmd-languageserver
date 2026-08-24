@@ -650,11 +650,12 @@ pub fn semantic_tokens(document: &OpenDocument) -> Vec<lsp_types::SemanticToken>
         .iter()
         .map(|token| {
             let (start, end) = line_index.range_to_positions(text, token.range);
+            // LSP semantic tokens are single-line: clamp a token whose
+            // analysis range spans lines to the end of its first line.
             let end = if end.line > start.line {
-                match line_index.line_end(text, start.line as usize) {
-                    Some(offset) => line_index.offset_to_position(text, offset),
-                    None => end,
-                }
+                line_index
+                    .line_end(text, start.line as usize)
+                    .map_or(end, |offset| line_index.offset_to_position(text, offset))
             } else {
                 end
             };

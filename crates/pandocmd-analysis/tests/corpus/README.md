@@ -107,9 +107,9 @@ pandoc, all now covered by regression tests in
   always consumed;
 - email autolinks resolve to `mailto:`;
 - `[label]:` takes the *entire* next non-blank line as its destination
-  (verified: `- list item` and even a fence line become the target), a
-  title-only line after a same-line definition is consumed, a trailing
-  definition at end of document still registers, and blank lines end grid
+  (verified: `- list item` and even a fence line become the target); a
+  title-only line after a same-line definition is consumed; a trailing
+  definition at end of document still registers; and blank lines end grid
   tables.
 
 The LSP layer was hardened in the same pass: wrapped-construct ranges are

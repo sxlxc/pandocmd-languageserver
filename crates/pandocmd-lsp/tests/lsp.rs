@@ -683,19 +683,17 @@ fn semantic_tokens_never_cross_lines() {
     // token must stay within the first line.
     let uri = test_uri("semantic-wrapped");
     let mut client = TestClient::start(None);
-    client.open(
-        &uri,
-        "# Title\n\nSee [the wrapped\nlink](https://example.com) now.\n",
-    );
+    let text = "# Title\n\nSee [the wrapped\nlink](https://example.com) now.\n";
+    client.open(&uri, text);
 
     let tokens: serde_json::Value = client.request::<SemanticTokensFullRequest>(json!({
         "textDocument": { "uri": uri }
     }));
     let data = tokens["data"].as_array().unwrap();
-    let line_lengths = [7usize, 0, 17, 32, 0];
+    // The document is ASCII, so byte length == UTF-16 length per line.
+    let line_lengths: Vec<usize> = text.split('\n').map(str::len).collect();
     let mut line = 0u64;
     let mut character = 0u64;
-    let mut decoded = 0usize;
     for chunk in data.chunks_exact(5) {
         let delta_line = chunk[0].as_u64().unwrap();
         let delta_start = chunk[1].as_u64().unwrap();
@@ -711,9 +709,11 @@ fn semantic_tokens_never_cross_lines() {
             character + length <= limit as u64,
             "token at {line}:{character}+{length} escapes the line (length {limit})"
         );
-        decoded += 1;
     }
-    assert!(decoded >= 2, "expected heading and link tokens: {tokens}");
+    assert!(
+        data.len() / 5 >= 2,
+        "expected heading and link tokens: {tokens}"
+    );
 }
 
 #[test]
@@ -733,26 +733,25 @@ fn document_links_cover_wrapped_links_and_continuation_definitions() {
         .iter()
         .find(|link| link["target"].as_str().unwrap().ends_with("/wrapped"))
         .expect("wrapped inline link");
-    assert_eq!(wrapped["range"]["start"]["line"], 1, "range: {wrapped}");
-    assert_eq!(
-        wrapped["range"]["start"]["character"], 6,
-        "range: {wrapped}"
-    );
-    assert_eq!(wrapped["range"]["end"]["character"], 33, "range: {wrapped}");
+    assert_eq!(link_range(wrapped), (1, 6, 1, 33));
 
     let continued = links
         .iter()
         .find(|link| link["target"].as_str().unwrap().ends_with("/continued"))
         .expect("continuation definition link");
-    assert_eq!(continued["range"]["start"]["line"], 4, "range: {continued}");
-    assert_eq!(
-        continued["range"]["start"]["character"], 2,
-        "range: {continued}"
-    );
-    assert_eq!(
-        continued["range"]["end"]["character"], 31,
-        "range: {continued}"
-    );
+    assert_eq!(link_range(continued), (4, 2, 4, 31));
+}
+
+/// Decode a document link's range as (start line, start character,
+/// end line, end character).
+fn link_range(link: &serde_json::Value) -> (u64, u64, u64, u64) {
+    let range = &link["range"];
+    (
+        range["start"]["line"].as_u64().unwrap(),
+        range["start"]["character"].as_u64().unwrap(),
+        range["end"]["line"].as_u64().unwrap(),
+        range["end"]["character"].as_u64().unwrap(),
+    )
 }
 
 #[test]
