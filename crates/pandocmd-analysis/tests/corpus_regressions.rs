@@ -422,3 +422,100 @@ fn gfm_heading_identifiers_drop_emphasis() {
     );
     let _ = Extension::Smart; // keep the import meaningful in all cfgs
 }
+
+// ---------------------------------------------------------------------------
+// LSP-facing behaviors: byte-exact ranges and pandoc reference semantics
+// (exercised end-to-end by the lsp integration tests)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reference_continuation_takes_the_whole_next_line() {
+    // Verified against pandoc: `[foo]:` followed by `- list item` defines
+    // target `- list item`; even a fence line becomes the target.
+    let analysis = analyze("[foo]:\n- list item\n\n[foo]\n");
+    assert_eq!(analysis.reference_definitions[0].target, "- list item");
+    let analysis = analyze("[foo]:\n```\n@cited\n```\n\n[foo]\n");
+    assert_eq!(analysis.reference_definitions[0].target, "```");
+    // The code fence consumed as a target means the block is not open, so
+    // the citation leaks in — exactly like pandoc.
+    assert_eq!(citation_keys_from(&analysis), vec!["cited".to_string()]);
+}
+
+#[test]
+fn continuation_targets_report_their_own_range() {
+    // The documentLink region of a continuation definition is the target
+    // line, not the label line.
+    let analysis = analyze("[ref]:\n  https://example.com/continued \"Title\"\n");
+    let text = "[ref]:\n  https://example.com/continued \"Title\"\n";
+    let link = analysis
+        .links
+        .iter()
+        .find(|link| link.kind == pandocmd_analysis::LinkKind::Definition)
+        .unwrap();
+    assert_eq!(
+        &text[link.target_range.start..link.target_range.end],
+        "https://example.com/continued"
+    );
+}
+
+#[test]
+fn same_line_definition_consumes_title_on_next_line() {
+    // Verified: pandoc swallows a title-only line after `[q]: /url`, so a
+    // citation inside it never materializes.
+    let analysis = analyze("[q]: /url\n\"[see @x]\"\n");
+    assert!(analysis.citations.is_empty());
+}
+
+#[test]
+fn trailing_definition_at_eof_still_registers() {
+    // `[label]:` as the last line must still define the label (with an
+    // empty target) instead of dropping it and flagging false
+    // unresolved-reference diagnostics.
+    let analysis = analyze("Use [foo] and [foo].\n\n[foo]:\n");
+    assert_eq!(analysis.reference_definitions.len(), 1);
+    assert!(!analysis
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "unresolved-reference"));
+}
+
+#[test]
+fn blank_lines_end_grid_tables() {
+    // Verified: after a blank line pandoc parses `| ... |` as a line block,
+    // not as another grid row, so deeply indented cell text is prose.
+    let analysis = analyze("+---+---+\n| a | b |\n+---+---+\n\n|     [@c] | x |\n");
+    assert_eq!(citation_keys_from(&analysis), vec!["c".to_string()]);
+}
+
+#[test]
+fn wrapped_link_ranges_are_byte_exact() {
+    // A link whose text wraps (with a trailing space before the newline —
+    // the case where the wrap joiner must still occupy the newline byte) has
+    // ranges that slice the exact construct and destination out of the
+    // document.
+    let text = "See [the \ndocs](https://example.com) end.\n";
+    let analysis = analyze(text);
+    assert_eq!(analysis.links.len(), 1);
+    let link = &analysis.links[0];
+    assert_eq!(
+        &text[link.range.start..link.range.end],
+        "[the \ndocs](https://example.com)"
+    );
+    assert_eq!(
+        &text[link.target_range.start..link.target_range.end],
+        "https://example.com"
+    );
+}
+
+#[test]
+fn wrapped_destination_ranges_cover_escaped_source_bytes() {
+    // The clickable region covers the raw destination including escapes.
+    let text = "See [docs](/hi\\(there\\)) now.\n";
+    let analysis = analyze(text);
+    let link = &analysis.links[0];
+    assert_eq!(link.target, "/hi(there)");
+    assert_eq!(
+        &text[link.target_range.start..link.target_range.end],
+        "/hi\\(there\\)"
+    );
+}

@@ -105,7 +105,19 @@ pandoc, all now covered by regression tests in
 - heading titles drop HTML comments, HTML tags, and emphasis markers before
   identifier computation, and trailing attribute blocks (`{.options}`) are
   always consumed;
-- email autolinks resolve to `mailto:`.
+- email autolinks resolve to `mailto:`;
+- `[label]:` takes the *entire* next non-blank line as its destination
+  (verified: `- list item` and even a fence line become the target), a
+  title-only line after a same-line definition is consumed, a trailing
+  definition at end of document still registers, and blank lines end grid
+  tables.
+
+The LSP layer was hardened in the same pass: wrapped-construct ranges are
+byte-exact (the wrap joiner occupies exactly the newline bytes, so hover,
+definition, and documentLink positions are correct even for CRLF documents),
+semantic tokens never cross line boundaries (invalid per the LSP
+specification), and continuation definitions report the target line — not
+the label line — as their clickable region.
 
 R Markdown and Quarto chunk fences (```` ```{r, …} ```` / ```` ```{{r}} ````)
 are rewritten to plain fences before pandoc sees them: they are invalid

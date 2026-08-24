@@ -36,8 +36,10 @@ static DEF_LIST_MARKER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[ \t]*(:{1,2}|~)[ \t]+([^ \t]*)").unwrap());
 /// The target (and optional title) continuation line of a reference
 /// definition whose URL is on a following line.
-static REF_DEF_CONTINUATION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^[ \t]*(<[^>]*>|\S+)(?:[ \t]+("[^"]*"|'[^']*'))?[ \t]*$"#).unwrap()
+/// A reference-definition continuation line that carries a trailing link
+/// title: `<target> "title"` / `<target> 'title'` / `<target> (title)`.
+static REF_DEF_CONTINUATION_TITLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^[ \t]*(.*?)[ \t]+("[^"\n]*"|'[^'\n]*'|\([^)\n]*\))[ \t]*$"#).unwrap()
 });
 static REF_DEF_TITLE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^[ \t]*("[^"]*"|'[^']*')[ \t]*$"#).unwrap());
@@ -170,11 +172,9 @@ struct ScanState<'a> {
     def_list_stack: Vec<usize>,
     /// Content column of the currently open bullet/ordered list.
     list_column: Option<usize>,
-    /// A reference definition `[label]:` seen with an empty target; the URL
-    /// may arrive on one of the following lines, possibly after blanks.
+    /// A reference definition `[label]:` seen with an empty target; pandoc
+    /// takes the entire next non-blank line as its destination.
     pending_ref_def: Option<PendingRefDef>,
-    /// Non-blank lines seen since the pending reference definition appeared.
-    pending_ref_def_lines: usize,
     /// The pending reference definition got its target; a following line may
     /// still be a quoted link title.
     pending_ref_title: bool,
@@ -222,8 +222,6 @@ struct PendingRefDef {
 /// Maximum non-blank lines between two table-rule-like lines for the second
 /// rule to be treated as the end of a table header.
 const RULE_GAP_MAX: usize = 4;
-/// Maximum lines a `[label]:` definition may wait for its target.
-const REF_DEF_PENDING_MAX: usize = 8;
 /// Maximum bytes of carried link text across line wraps.
 const LINK_CARRY_MAX: usize = 1000;
 
@@ -261,7 +259,6 @@ impl<'a> ScanState<'a> {
             def_list_stack: Vec::new(),
             list_column: None,
             pending_ref_def: None,
-            pending_ref_def_lines: 0,
             pending_ref_title: false,
             table_rule_gap: None,
             in_multiline_table: false,
@@ -305,6 +302,9 @@ impl<'a> ScanState<'a> {
                 self.in_multiline_table = false;
             }
             self.table_rule_just_seen = false;
+            // Blank lines end grid tables (pandoc parses a later `|` line
+            // as a line block, not as another row).
+            self.in_grid_table = false;
             // Table headers never contain blank lines between their rules.
             self.table_rule_gap = None;
             // A held setext underline commits: `Text\n-----\n\nMore` is a
@@ -321,8 +321,7 @@ impl<'a> ScanState<'a> {
             // the sense that pandoc never takes a URL after a blank: close
             // it with an empty target.
             if let Some(pending) = self.pending_ref_def.take() {
-                self.push_reference_definition(pending, String::new());
-                self.pending_ref_title = false;
+                self.push_reference_definition(pending, String::new(), None);
             }
             self.pending_ref_title = false;
             return;
@@ -417,6 +416,17 @@ impl<'a> ScanState<'a> {
             self.example_labels.insert(label);
         }
 
+        // A reference definition waiting for its target consumes the entire
+        // next non-blank line as its destination — before any other block
+        // interpretation, so even a fence line becomes the target (matching
+        // pandoc).
+        if (self.pending_ref_def.is_some() || self.pending_ref_title)
+            && self.resolve_pending_ref_def(line, byte_offset)
+        {
+            self.after_blank = false;
+            return;
+        }
+
         // Fenced code blocks hide every other construct.
         if let Some(fence) = &self.code_fence {
             if let Some((delimiter, length)) = fence_marker(line) {
@@ -462,15 +472,6 @@ impl<'a> ScanState<'a> {
             return;
         }
 
-        // A reference definition waiting for its target consumes the next
-        // non-blank line if it looks like `target` or `target "title"`.
-        if (self.pending_ref_def.is_some() || self.pending_ref_title)
-            && self.resolve_pending_ref_def(line, byte_offset)
-        {
-            self.after_blank = false;
-            return;
-        }
-
         // Grid tables: `+---+` rules start one, `| ... |` lines are rows
         // whose cells can contain block content (headings, code cells).
         if GRID_RULE_RE.is_match(line) {
@@ -508,8 +509,16 @@ impl<'a> ScanState<'a> {
         let inline_base;
         match &carried {
             Some((carry_offset, carry_strict, carry_raw)) => {
-                // Pandoc turns the wrapped newline into a space.
-                let joiner = if carry_strict.ends_with(' ') { "" } else { " " };
+                // The joiner occupies exactly the bytes between the carried
+                // text and this line (the newline, or CRLF), so every offset
+                // in the joined text is an exact document offset. Pandoc
+                // renders the wrap as a single space; whitespace collapses
+                // during label normalization.
+                let joiner = " ".repeat(
+                    byte_offset
+                        .saturating_sub(carry_offset + carry_strict.len())
+                        .max(1),
+                );
                 inline_text = format!("{carry_strict}{joiner}{masked}");
                 inline_raw = format!("{carry_raw}{joiner}{line}");
                 inline_base = *carry_offset;
@@ -614,26 +623,14 @@ impl<'a> ScanState<'a> {
     /// consumed as part of the definition.
     fn resolve_pending_ref_def(&mut self, line: &str, byte_offset: usize) -> bool {
         if let Some(pending) = self.pending_ref_def.take() {
-            self.pending_ref_def_lines += 1;
-            if self.pending_ref_def_lines > REF_DEF_PENDING_MAX {
-                self.push_reference_definition(pending, String::new());
-                self.pending_ref_def_lines = 0;
-                return false;
-            }
-            if let Some(captures) = REF_DEF_CONTINUATION_RE.captures(line) {
-                let target = captures
-                    .get(1)
-                    .map(|target| target.as_str())
-                    .unwrap_or_default();
-                let target = target.trim_start_matches('<').trim_end_matches('>');
-                self.push_reference_definition(pending, target.to_string());
-                self.pending_ref_title = captures.get(2).is_none();
-                self.pending_ref_def_lines = 0;
-                return true;
-            }
-            self.push_reference_definition(pending, String::new());
-            self.pending_ref_def_lines = 0;
-            return false;
+            // Pandoc takes the entire next non-blank line as the
+            // destination, splitting an optional trailing quoted or
+            // parenthesized title (verified: `[foo]:` + `- list item`
+            // defines target `- list item`).
+            let (target, range, has_title) = continuation_target(line, byte_offset);
+            self.push_reference_definition(pending, target, range);
+            self.pending_ref_title = !has_title;
+            return true;
         }
         if self.pending_ref_title {
             self.pending_ref_title = false;
@@ -645,20 +642,27 @@ impl<'a> ScanState<'a> {
         false
     }
 
-    fn push_reference_definition(&mut self, pending: PendingRefDef, target: String) {
+    fn push_reference_definition(
+        &mut self,
+        pending: PendingRefDef,
+        target: String,
+        target_range: Option<TextRange>,
+    ) {
         let PendingRefDef {
             label,
             normalized_label,
             label_range,
         } = pending;
         if !target.is_empty() {
+            let target_range = target_range.unwrap_or(label_range);
             self.output.analysis.links.push(MarkdownLink {
                 kind: LinkKind::Definition,
                 target: target.clone(),
                 label: Some(label.clone()),
                 range: label_range,
-                target_range: label_range,
+                target_range,
             });
+            self.push_semantic_token(SemanticTokenKind::Link, target_range);
         }
         self.output
             .analysis
@@ -737,6 +741,11 @@ impl<'a> ScanState<'a> {
 
     fn finish(&mut self, document_len: usize) {
         self.finish_unclosed_fenced_divs(document_len);
+        if let Some(pending) = self.pending_ref_def.take() {
+            // A `[label]:` at end of document never got its target line.
+            self.push_reference_definition(pending, String::new(), None);
+        }
+        self.pending_ref_title = false;
         let analysis = &mut self.output.analysis;
         analysis
             .diagnostics
@@ -835,17 +844,12 @@ impl<'a> ScanState<'a> {
                         byte_offset + label.end(),
                     ),
                 });
-                self.pending_ref_def_lines = 0;
                 self.pending_ref_title = false;
                 return;
             }
-            if let Some(title) = captures.get(3) {
-                if REF_DEF_TITLE_RE.is_match(title.as_str()) {
-                    // `[label]: url "title"`: the title already sits on this
-                    // line, so no continuation follows.
-                    self.pending_ref_title = false;
-                }
-            }
+            // A same-line title completes the definition; without one,
+            // pandoc still consumes a title-only line that follows.
+            self.pending_ref_title = captures.get(3).is_none();
             let target_text = target
                 .as_str()
                 .trim()
@@ -1356,8 +1360,13 @@ impl<'a> ScanState<'a> {
         let scan_base;
         match &carried {
             Some((carry_offset, carry_strict, carry_raw)) => {
-                // Pandoc turns the wrapped newline into a space.
-                let joiner = if carry_strict.ends_with(' ') { "" } else { " " };
+                // The joiner occupies exactly the newline bytes between the
+                // carried text and this line, keeping offsets exact.
+                let joiner = " ".repeat(
+                    byte_offset
+                        .saturating_sub(carry_offset + carry_strict.len())
+                        .max(1),
+                );
                 virtual_text = format!("{carry_strict}{joiner}{masked}");
                 virtual_raw = format!("{carry_raw}{joiner}{raw_line}");
                 scan_base = *carry_offset;
@@ -1446,17 +1455,17 @@ impl<'a> ScanState<'a> {
             } else {
                 LinkKind::Image
             };
-            let url_offset = if url.as_str().starts_with('<') {
-                url.start() + 1
-            } else {
-                url.start()
-            };
+            let angle = usize::from(url.as_str().starts_with('<'));
+            let url_offset = url.start() + angle;
+            // The range covers the raw source bytes of the destination
+            // (escapes and all), not the unescaped target length.
+            let raw_dest_len = url.as_str().len().saturating_sub(2 * angle);
             self.output.analysis.links.push(MarkdownLink {
                 kind,
                 target: target.to_string(),
                 label: Some(text.as_str().to_string()),
                 range: TextRange::new(base + whole.start(), base + whole.end()),
-                target_range: TextRange::new(base + url_offset, base + url_offset + target.len()),
+                target_range: TextRange::new(base + url_offset, base + url_offset + raw_dest_len),
             });
             self.push_semantic_token(
                 SemanticTokenKind::Link,
@@ -2015,6 +2024,43 @@ fn strip_inline_html_tags(title: &str) -> String {
     }
     cleaned.push_str(rest);
     cleaned
+}
+
+/// Split a reference-definition continuation line into (target, range,
+/// has_title). The target may be wrapped in `<...>`; the range excludes the
+/// brackets and any surrounding whitespace.
+fn continuation_target(line: &str, byte_offset: usize) -> (String, Option<TextRange>, bool) {
+    if let Some(captures) = REF_DEF_CONTINUATION_TITLE_RE.captures(line) {
+        let head = captures.get(1).unwrap();
+        let trimmed = head.as_str().trim_end();
+        let (text, range) = angle_target_with_range(
+            trimmed,
+            byte_offset + head.start() + (head.as_str().len() - trimmed.len()),
+        );
+        return (text, range, true);
+    }
+    let trimmed = line.trim();
+    let lead = line.len() - line.trim_start().len();
+    let (text, range) = angle_target_with_range(trimmed, byte_offset + lead);
+    (text, range, false)
+}
+
+/// Strip optional angle brackets from a target while reporting the range of
+/// the destination text itself.
+fn angle_target_with_range(text: &str, start: usize) -> (String, Option<TextRange>) {
+    let inner = text
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'));
+    match inner {
+        Some(inner) => (
+            inner.to_string(),
+            Some(TextRange::new(start + 1, start + 1 + inner.len())),
+        ),
+        None => (
+            text.to_string(),
+            Some(TextRange::new(start, start + text.len())),
+        ),
+    }
 }
 
 /// A grid-table rule line (`+---+---+`, `+===+===+`).

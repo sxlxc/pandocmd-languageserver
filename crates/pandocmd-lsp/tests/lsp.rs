@@ -677,6 +677,100 @@ fn semantic_tokens_encode_headings_and_citations() {
 }
 
 #[test]
+fn semantic_tokens_never_cross_lines() {
+    // A link whose text wraps onto the next line produces an analysis range
+    // that spans two lines; LSP semantic tokens cannot, so the encoded
+    // token must stay within the first line.
+    let uri = test_uri("semantic-wrapped");
+    let mut client = TestClient::start(None);
+    client.open(
+        &uri,
+        "# Title\n\nSee [the wrapped\nlink](https://example.com) now.\n",
+    );
+
+    let tokens: serde_json::Value = client.request::<SemanticTokensFullRequest>(json!({
+        "textDocument": { "uri": uri }
+    }));
+    let data = tokens["data"].as_array().unwrap();
+    let line_lengths = [7usize, 0, 17, 32, 0];
+    let mut line = 0u64;
+    let mut character = 0u64;
+    let mut decoded = 0usize;
+    for chunk in data.chunks_exact(5) {
+        let delta_line = chunk[0].as_u64().unwrap();
+        let delta_start = chunk[1].as_u64().unwrap();
+        let length = chunk[2].as_u64().unwrap();
+        line += delta_line;
+        character = if delta_line == 0 {
+            character + delta_start
+        } else {
+            delta_start
+        };
+        let limit = line_lengths[line as usize];
+        assert!(
+            character + length <= limit as u64,
+            "token at {line}:{character}+{length} escapes the line (length {limit})"
+        );
+        decoded += 1;
+    }
+    assert!(decoded >= 2, "expected heading and link tokens: {tokens}");
+}
+
+#[test]
+fn document_links_cover_wrapped_links_and_continuation_definitions() {
+    let uri = test_uri("links-wrapped");
+    let mut client = TestClient::start(None);
+    client.open(
+        &uri,
+        "See [the \ndocs](https://example.com/wrapped).\n\n[ref]:\n  https://example.com/continued \"Title\"\n\nUse [ref].\n",
+    );
+
+    let links: serde_json::Value = client.request::<DocumentLinkRequest>(json!({
+        "textDocument": { "uri": uri }
+    }));
+    let links = links.as_array().unwrap();
+    let wrapped = links
+        .iter()
+        .find(|link| link["target"].as_str().unwrap().ends_with("/wrapped"))
+        .expect("wrapped inline link");
+    assert_eq!(wrapped["range"]["start"]["line"], 1, "range: {wrapped}");
+    assert_eq!(
+        wrapped["range"]["start"]["character"], 6,
+        "range: {wrapped}"
+    );
+    assert_eq!(wrapped["range"]["end"]["character"], 33, "range: {wrapped}");
+
+    let continued = links
+        .iter()
+        .find(|link| link["target"].as_str().unwrap().ends_with("/continued"))
+        .expect("continuation definition link");
+    assert_eq!(continued["range"]["start"]["line"], 4, "range: {continued}");
+    assert_eq!(
+        continued["range"]["start"]["character"], 2,
+        "range: {continued}"
+    );
+    assert_eq!(
+        continued["range"]["end"]["character"], 31,
+        "range: {continued}"
+    );
+}
+
+#[test]
+fn trailing_definition_at_eof_does_not_flag_references() {
+    let uri = test_uri("def-eof");
+    let mut client = TestClient::start(None);
+    client.open(&uri, "Use [foo] here.\n\n[foo]:\n");
+
+    let diagnostics = client.diagnostics_for(&uri);
+    assert!(
+        !codes(&diagnostics)
+            .iter()
+            .any(|code| code == "unresolved-reference"),
+        "diagnostics: {diagnostics:?}"
+    );
+}
+
+#[test]
 fn folding_ranges_cover_metadata_and_divs() {
     let uri = test_uri("folding");
     let mut client = TestClient::start(None);

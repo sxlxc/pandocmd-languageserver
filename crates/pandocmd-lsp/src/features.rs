@@ -637,6 +637,10 @@ pub const SEMANTIC_TOKEN_LEGEND: &[&str] = &[
 ];
 
 /// Encode analysis semantic tokens into the LSP delta format.
+///
+/// LSP semantic tokens cannot span lines, so a token whose analysis range
+/// crosses a line boundary (for example a link whose text wraps onto the
+/// next line) is clamped to the end of its first line.
 pub fn semantic_tokens(document: &OpenDocument) -> Vec<lsp_types::SemanticToken> {
     let text = document.parsed.text();
     let line_index = document.parsed.line_index();
@@ -646,6 +650,14 @@ pub fn semantic_tokens(document: &OpenDocument) -> Vec<lsp_types::SemanticToken>
         .iter()
         .map(|token| {
             let (start, end) = line_index.range_to_positions(text, token.range);
+            let end = if end.line > start.line {
+                match line_index.line_end(text, start.line as usize) {
+                    Some(offset) => line_index.offset_to_position(text, offset),
+                    None => end,
+                }
+            } else {
+                end
+            };
             let kind_index = SEMANTIC_TOKEN_LEGEND
                 .iter()
                 .position(|name| *name == token.kind.name())
@@ -657,6 +669,7 @@ pub fn semantic_tokens(document: &OpenDocument) -> Vec<lsp_types::SemanticToken>
                 kind_index,
             )
         })
+        .filter(|(_, _, length, _)| *length > 0)
         .collect();
     tokens.sort();
 
