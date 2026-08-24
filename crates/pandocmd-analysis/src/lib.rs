@@ -703,8 +703,10 @@ pub enum SymbolAtOffset<'a> {
     Citation(&'a Citation),
 }
 
-/// Normalize a reference label the way Pandoc does: case-folded internal
-/// whitespace collapsed.
+/// Normalize a reference label the way Pandoc does: case-folded with
+/// internal whitespace collapsed. Formatting characters are part of the
+/// label (`` [`x`] `` and `[x]` are different labels, verified against
+/// pandoc).
 pub fn normalize_label(label: &str) -> String {
     label
         .split_whitespace()

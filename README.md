@@ -147,6 +147,17 @@ same `Connection::memory()` harness rust-analyzer uses), and ground-truth
 tests that cross-check defaults and heading identifiers against an
 installed `pandoc` (auto-skipped when pandoc is absent).
 
+A differential corpus test additionally parses real-world documents from
+the internet (the Pandoc User's Guide source, pandoc's reader test suite,
+Quarto docs, the R Markdown Cookbook, a large GFM README) with both this
+server and `pandoc` itself, and requires identical headings, citations,
+footnotes, link resolution, and fenced divs. The corpus is downloaded on
+demand; see `crates/pandocmd-analysis/tests/corpus/README.md`. The
+behaviors it verified are pinned by
+`crates/pandocmd-analysis/tests/corpus_regressions.rs`, and
+`cargo run -p pandocmd-analysis --example dump -- file.md` prints the
+analysis facts with line numbers for debugging.
+
 ## Release
 
 GitHub release assets are built by `.github/workflows/release.yml` when a

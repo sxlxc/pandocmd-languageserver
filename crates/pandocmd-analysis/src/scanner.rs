@@ -6,7 +6,7 @@
 //! diagnostics, and scanning never runs inside fenced code blocks or the
 //! YAML metadata block.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use pandocmd_extensions::{Extension, ExtensionSet};
@@ -22,13 +22,30 @@ use crate::{
 };
 
 static HEADING_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(#{1,6})[ \t]+(.+?)[ \t#]*$").unwrap());
+    LazyLock::new(|| Regex::new(r"^[ \t]{0,3}(?:>[ \t]*)*(#{1,6})[ \t]+(.+?)[ \t#]*$").unwrap());
 static SETEXT_UNDERLINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[ \t]{0,3}(=+|-+)[ \t]*$").unwrap());
+/// A line made only of hyphens and spaces (at least three hyphens): a
+/// possible simple/multiline table rule. Two such lines with table content
+/// between them activate multiline-table mode, in which hyphen rules are row
+/// separators instead of setext underlines (matching pandoc).
+static TABLE_RULE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[ \t]{0,3}(?:-[ \t]*){3,}$").unwrap());
+/// Definition-list definition marker (`:`, `::`, or `~` followed by space).
+static DEF_LIST_MARKER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[ \t]*(:{1,2}|~)[ \t]+([^ \t]*)").unwrap());
+/// The target (and optional title) continuation line of a reference
+/// definition whose URL is on a following line.
+static REF_DEF_CONTINUATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^[ \t]*(<[^>]*>|\S+)(?:[ \t]+("[^"]*"|'[^']*'))?[ \t]*$"#).unwrap()
+});
+static REF_DEF_TITLE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^[ \t]*("[^"]*"|'[^']*')[ \t]*$"#).unwrap());
 static FOOTNOTE_DEF_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[ \t]{0,3}\[\^([^\]\n]+)\]:").unwrap());
-static REF_DEF_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[ \t]{0,3}\[([^\]\n]+)\]:[ \t]*(\S*)(?:[ \t]+(.*))?$").unwrap());
+    LazyLock::new(|| Regex::new(r"^[ \t]*\[\^([^\]\n]+)\]:").unwrap());
+static REF_DEF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^[ \t]*\[([^\]\n]+)\]:[ \t]*(<[^>\n]*>|(?:[^\s\n][^\n]*?)?)(?:[ \t]+("[^"\n]*"|\([^)\n]*\)|'[^'\n]*'))?[ \t]*$"#).unwrap()
+});
 static FULL_REF_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[([^\]\n]+)\]\[([^\]\n]+)\]").unwrap());
 static COLLAPSED_REF_RE: LazyLock<Regex> =
@@ -43,17 +60,22 @@ static HEADING_LINK_RE: LazyLock<Regex> =
 static CITATION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(^|[\s;\[\(\s"'])(-?@)([A-Za-z0-9_:.#$%&+\-?<>~/]+)"#).unwrap());
 static FENCED_DIV_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[ \t]{0,3}(:{3,})(.*)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^[ \t]*(?:>[ \t]*)*(:{3,})(.*)$").unwrap());
 static BRACED_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{([^}\n]*)\}").unwrap());
 static IMAGE_ATTR_PREFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"!\[[^\]\n]*\]\([^\)\n]*\)\s*$").unwrap());
 static CODE_FENCE_ATTR_PREFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[ \t]{0,3}(`{3,}|~{3,})\s*$").unwrap());
 static INLINE_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(!?)\[([^\]\n]*)\]\((<[^>\s]*>|[^()\s]*)(?:[ \t]+"([^\"]*)")?\)"#).unwrap()
+    // Link text may contain one level of nested brackets (notably
+    // `[![alt](src)](target)` badge links); the destination itself may not
+    // contain unbalanced parentheses.
+    Regex::new(r#"(!?)\[([^\[\]\n]*(?:\[[^\[\]\n]*\][^\[\]\n]*)*(?:\[[^\]\n]*)?)\]\([ \t]*(<[^>\n]*>|(?:\\[()]|[^()\s])*(?:\((?:\\[()]|[^()\s\\])*\)(?:\\[()]|[^()\s])*)*|(?:[^()\n\\]|\\.)*?)(?:[ \t]+("[^"\n]*"|\([^)\n]*\)|'[^'\n]*'))?[ \t]*\)"#).unwrap()
 });
 static AUTOLINK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<([a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^<>\s]+)>").unwrap());
+static EMAIL_AUTOLINK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<([^<>\s@:]+@[^<>\s@]+)>").unwrap());
 static STRIKEOUT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"~~([^\s~][^~]*?)~~").unwrap());
 static SUPERSCRIPT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\^([^\s^\[\]]+)\^").unwrap());
@@ -93,6 +115,15 @@ pub fn scan_document(text: &str, options: &AnalyzeOptions) -> ScanOutput {
     let mut scan = ScanState::new(options);
     let mut byte_offset = 0;
 
+    // Example-list labels are collected in a pre-pass: pandoc resolves
+    // `(@label)` references against the complete set, even when the marker
+    // appears later in the document.
+    for line in text.lines() {
+        if let Some(label) = example_list_label(line) {
+            scan.example_labels.insert(label);
+        }
+    }
+
     for line in text.split_inclusive('\n') {
         let line_without_newline = line.trim_end_matches(['\r', '\n']);
         scan.line(line_without_newline, byte_offset);
@@ -127,7 +158,74 @@ struct ScanState<'a> {
     /// `text\n====` into a setext heading.
     pending_paragraph: Vec<(usize, String)>,
     pending_setext_level: Option<u8>,
+    /// True when the previous line was blank (or at document start): a
+    /// deeply-indented non-blank line then starts an indented code block,
+    /// like in pandoc.
+    after_blank: bool,
+    /// Inside an indented code block; lines are skipped until a non-blank
+    /// line with insufficient indentation arrives.
+    in_indented_code: bool,
+    /// Content columns of the currently open (nested) definition lists,
+    /// used to distinguish list content from indented code.
+    def_list_stack: Vec<usize>,
+    /// Content column of the currently open bullet/ordered list.
+    list_column: Option<usize>,
+    /// A reference definition `[label]:` seen with an empty target; the URL
+    /// may arrive on one of the following lines, possibly after blanks.
+    pending_ref_def: Option<PendingRefDef>,
+    /// Non-blank lines seen since the pending reference definition appeared.
+    pending_ref_def_lines: usize,
+    /// The pending reference definition got its target; a following line may
+    /// still be a quoted link title.
+    pending_ref_title: bool,
+    /// Non-blank, non-rule lines since the last table-rule-like line, when a
+    /// rule was seen recently (`Some(gap)` with `gap <= RULE_GAP_MAX`).
+    table_rule_gap: Option<usize>,
+    /// Between the rules of a simple/multiline table: hyphen rules are row
+    /// separators, never setext underlines.
+    in_multiline_table: bool,
+    table_rule_just_seen: bool,
+    /// Text of an unclosed `[` at the end of the previous line, plus its
+    /// absolute offset: inline link text may wrap onto the next line. Both
+    /// the fully masked variant (for links, citations) and the raw variant
+    /// (reference labels keep formatting characters) are carried.
+    link_carry: Option<(usize, String, String)>,
+    /// Length of an unclosed backtick run at the end of the previous line:
+    /// inline code spans may wrap across lines.
+    code_span_carry: Option<usize>,
+    /// Inside a grid table (`+---+` rules, `| ... |` rows): row cells get
+    /// block-aware treatment (headings, code cells).
+    in_grid_table: bool,
+    /// Labels of example-list markers (`(@label) text`) seen so far, used to
+    /// distinguish `(@label)` example references from citations.
+    example_labels: HashSet<String>,
+    /// A setext underline seen with a pending paragraph that may still turn
+    /// out to be a table rule instead; committed on the next line.
+    held_setext: Option<HeldSetext>,
 }
+
+/// A setext heading held for one line to disambiguate it from the first
+/// rule of a table header.
+struct HeldSetext {
+    level: u8,
+    document_end: usize,
+    paragraph: Vec<(usize, String)>,
+}
+
+/// A `[label]:` definition still waiting for its target line.
+struct PendingRefDef {
+    label: String,
+    normalized_label: String,
+    label_range: pandocmd_syntax::TextRange,
+}
+
+/// Maximum non-blank lines between two table-rule-like lines for the second
+/// rule to be treated as the end of a table header.
+const RULE_GAP_MAX: usize = 4;
+/// Maximum lines a `[label]:` definition may wait for its target.
+const REF_DEF_PENDING_MAX: usize = 8;
+/// Maximum bytes of carried link text across line wraps.
+const LINK_CARRY_MAX: usize = 1000;
 
 struct CodeFence {
     delimiter: char,
@@ -158,6 +256,21 @@ impl<'a> ScanState<'a> {
             previous_was_paragraph: false,
             pending_paragraph: Vec::new(),
             pending_setext_level: None,
+            after_blank: true,
+            in_indented_code: false,
+            def_list_stack: Vec::new(),
+            list_column: None,
+            pending_ref_def: None,
+            pending_ref_def_lines: 0,
+            pending_ref_title: false,
+            table_rule_gap: None,
+            in_multiline_table: false,
+            table_rule_just_seen: false,
+            link_carry: None,
+            code_span_carry: None,
+            in_grid_table: false,
+            example_labels: HashSet::new(),
+            held_setext: None,
         }
     }
 
@@ -180,6 +293,128 @@ impl<'a> ScanState<'a> {
                 self.metadata_seen = true;
             }
             return;
+        }
+
+        let carried = self.link_carry.take();
+        let code_carry = self.code_span_carry.take();
+
+        if line.trim().is_empty() {
+            self.after_blank = true;
+            if self.in_multiline_table && self.table_rule_just_seen {
+                // A table rule followed by a blank line ends the table.
+                self.in_multiline_table = false;
+            }
+            self.table_rule_just_seen = false;
+            // Table headers never contain blank lines between their rules.
+            self.table_rule_gap = None;
+            // A held setext underline commits: `Text\n-----\n\nMore` is a
+            // heading followed by a paragraph in pandoc.
+            if let Some(held) = self.held_setext.take() {
+                self.pending_setext_level = Some(held.level);
+                self.pending_paragraph = held.paragraph;
+                self.push_setext_heading(held.document_end);
+                self.pending_paragraph.clear();
+            }
+            self.previous_was_paragraph = false;
+            self.pending_paragraph.clear();
+            // A pending `[label]:` keeps waiting across blank lines only in
+            // the sense that pandoc never takes a URL after a blank: close
+            // it with an empty target.
+            if let Some(pending) = self.pending_ref_def.take() {
+                self.push_reference_definition(pending, String::new());
+                self.pending_ref_title = false;
+            }
+            self.pending_ref_title = false;
+            return;
+        }
+
+        // Indented code blocks. Inside a definition or bullet list, content
+        // indented to the list's content column is list content; four or
+        // more columns beyond it (or beyond column 0 outside lists) after a
+        // blank line starts indented code, like pandoc.
+        let (quote_depth, content_indent) = line_geometry(line);
+        let list_base = self
+            .def_list_stack
+            .last()
+            .copied()
+            .or(self.list_column)
+            .unwrap_or(0);
+        let code_threshold = list_base + 4 + 2 * quote_depth;
+        if self.in_indented_code {
+            if content_indent >= code_threshold {
+                self.after_blank = false;
+                return;
+            }
+            self.in_indented_code = false;
+        } else if self.after_blank && content_indent >= code_threshold {
+            self.in_indented_code = true;
+            self.after_blank = false;
+            return;
+        }
+
+        // A held setext underline commits unless this line reveals that it
+        // was the opening rule of a table header instead.
+        let mut held = self.held_setext.take();
+        if TABLE_RULE_RE.is_match(line) || GRID_RULE_RE.is_match(line) {
+            if let Some(held) = held.take() {
+                self.table_rule_gap = Some(0);
+                let _ = held;
+            }
+        } else if let Some(held) = held.take() {
+            self.pending_setext_level = Some(held.level);
+            self.pending_paragraph = held.paragraph.clone();
+            self.push_setext_heading(held.document_end);
+            self.pending_paragraph = held.paragraph;
+            self.previous_was_paragraph = true;
+        }
+
+        // Track list content columns so that deeply-indented fences, divs,
+        // and definitions inside list items are recognized as list content
+        // rather than indented code.
+        if quote_depth == 0 {
+            // A definition marker only starts a (nested) definition when it
+            // sits at the enclosing item's content column; deeper or
+            // shallower markers are prose. A nested definition raises the
+            // content column to the marker's text column.
+            while self
+                .def_list_stack
+                .last()
+                .is_some_and(|column| content_indent < *column)
+            {
+                self.def_list_stack.pop();
+            }
+            let active_column = self
+                .def_list_stack
+                .last()
+                .copied()
+                .or(self.list_column)
+                .filter(|column| *column > 0);
+            let marker_indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+            let marker_valid = match active_column {
+                Some(column) => marker_indent == column,
+                None => marker_indent <= 3,
+            };
+            if let (true, Some(column)) = (marker_valid, definition_list_content_column(line)) {
+                self.def_list_stack.push(column);
+            } else if let Some(column) = list_content_column(line) {
+                // Nested bullet lists never raise the effective content
+                // column beyond the outermost item's column.
+                self.list_column = Some(
+                    self.list_column
+                        .map_or(column, |old: usize| old.min(column)),
+                );
+            } else if self
+                .list_column
+                .is_some_and(|column| content_indent < column)
+            {
+                self.list_column = None;
+            }
+        }
+
+        // Example-list markers register their labels so that `(@label)`
+        // references elsewhere are not mistaken for citations.
+        if let Some(label) = example_list_label(line) {
+            self.example_labels.insert(label);
         }
 
         // Fenced code blocks hide every other construct.
@@ -223,28 +458,144 @@ impl<'a> ScanState<'a> {
                 TextRange::new(byte_offset, byte_offset + line.len()),
             );
             self.previous_was_paragraph = false;
+            self.after_blank = false;
             return;
         }
 
-        // Setext heading underline: `Heading text` + `======`.
+        // A reference definition waiting for its target consumes the next
+        // non-blank line if it looks like `target` or `target "title"`.
+        if (self.pending_ref_def.is_some() || self.pending_ref_title)
+            && self.resolve_pending_ref_def(line, byte_offset)
+        {
+            self.after_blank = false;
+            return;
+        }
+
+        // Grid tables: `+---+` rules start one, `| ... |` lines are rows
+        // whose cells can contain block content (headings, code cells).
+        if GRID_RULE_RE.is_match(line) {
+            if !self.extensions.contains(Extension::GridTables) {
+                if self.options.disabled_extensions {
+                    self.push_disabled_diagnostic(
+                        Extension::GridTables,
+                        TextRange::new(byte_offset, byte_offset + line.len()),
+                        Severity::Warning,
+                        "grid tables are disabled",
+                    );
+                }
+            } else {
+                self.in_grid_table = true;
+            }
+            self.previous_was_paragraph = false;
+            self.pending_paragraph.clear();
+            self.after_blank = false;
+            return;
+        }
+        let grid_row = self.in_grid_table && line.trim_start().starts_with('|');
+        if self.in_grid_table && !grid_row {
+            self.in_grid_table = false;
+        }
+        let mut masked = mask_inline_code_with_carry(line, code_carry, &mut self.code_span_carry);
+        if grid_row {
+            let mut row_masked = masked.clone().into_bytes();
+            self.scan_grid_row_cells(line, byte_offset, &masked, &mut row_masked);
+            masked = String::from_utf8(row_masked).expect("row mask is valid UTF-8");
+        }
+        // Inline scanners see the virtual text that joins any link-text
+        // carry from the previous line, so wrapped reference links are found.
+        let inline_text;
+        let inline_raw;
+        let inline_base;
+        match &carried {
+            Some((carry_offset, carry_strict, carry_raw)) => {
+                // Pandoc turns the wrapped newline into a space.
+                let joiner = if carry_strict.ends_with(' ') { "" } else { " " };
+                inline_text = format!("{carry_strict}{joiner}{masked}");
+                inline_raw = format!("{carry_raw}{joiner}{line}");
+                inline_base = *carry_offset;
+            }
+            None => {
+                inline_text = masked.clone();
+                inline_raw = line.to_string();
+                inline_base = byte_offset;
+            }
+        }
+
+        // Simple/multiline table rules: two hyphen rules with (header)
+        // content between them mean table mode, in which further rules are
+        // row separators instead of setext underlines.
+        if TABLE_RULE_RE.is_match(line) {
+            if self.in_multiline_table {
+                self.table_rule_just_seen = true;
+                self.pending_paragraph.clear();
+                self.previous_was_paragraph = false;
+                self.after_blank = false;
+                return;
+            }
+            if self.table_rule_gap.is_some_and(|gap| gap >= 1) {
+                // Entering the table body: the header-end rule must not arm
+                // the blank-line exit (bodies may contain blank lines).
+                self.in_multiline_table = true;
+                self.table_rule_just_seen = false;
+                self.pending_paragraph.clear();
+                self.previous_was_paragraph = false;
+                self.table_rule_gap = None;
+                self.after_blank = false;
+                return;
+            }
+            self.table_rule_gap = Some(0);
+        } else if self
+            .table_rule_gap
+            .is_some_and(|gap| gap + 1 > RULE_GAP_MAX)
+        {
+            self.table_rule_gap = None;
+        } else if let Some(gap) = self.table_rule_gap {
+            self.table_rule_gap = Some(gap + 1);
+        }
+
+        // Setext heading underline: `Heading text` + `======`. A hyphen
+        // underline right after a hyphen rule (or inside a table) is a table
+        // separator instead; hyphen underlines are held for one line so a
+        // following rule can still claim them for a table.
         if self.previous_was_paragraph {
             if let Some(captures) = SETEXT_UNDERLINE_RE.captures(line) {
                 let marker = captures.get(1).unwrap();
-                self.pending_setext_level = Some(if marker.as_str().starts_with('=') {
+                let level = if marker.as_str().starts_with('=') {
                     1
                 } else {
                     2
-                });
+                };
+                if level == 2 && !self.in_multiline_table {
+                    // Could still be the first rule of a table header; hold
+                    // for one line before committing the heading.
+                    self.held_setext = Some(HeldSetext {
+                        level: 2,
+                        document_end: byte_offset + line.len(),
+                        paragraph: std::mem::take(&mut self.pending_paragraph),
+                    });
+                    self.previous_was_paragraph = false;
+                    self.after_blank = false;
+                    return;
+                }
+                if self.in_multiline_table {
+                    self.pending_paragraph.clear();
+                    self.previous_was_paragraph = false;
+                    self.after_blank = false;
+                    return;
+                }
+                self.pending_setext_level = Some(level);
+                self.table_rule_gap = None;
                 self.push_setext_heading(byte_offset + line.len());
+                self.after_blank = false;
                 return;
             }
         }
 
         self.scan_div_line(line, byte_offset);
-        self.scan_block_line(line, byte_offset);
-        self.scan_inline_line(line, byte_offset);
-        self.scan_disabled_inline(line, byte_offset);
-        self.scan_links(line, byte_offset);
+        self.scan_block_line(line, &masked, byte_offset);
+        self.scan_inline_line(&inline_text, &inline_raw, line, byte_offset, inline_base);
+        self.scan_disabled_inline(line, &masked, byte_offset);
+        self.scan_links_with_carry(line, byte_offset, carried, &masked, line);
 
         self.previous_was_paragraph = !line.trim().is_empty()
             && !HEADING_RE.is_match(line)
@@ -255,6 +606,70 @@ impl<'a> ScanState<'a> {
         } else {
             self.pending_paragraph.clear();
         }
+        self.after_blank = false;
+    }
+
+    /// Feed a pending `[label]:` definition with this line, if the line is
+    /// its target (or target plus title). Returns true when the line was
+    /// consumed as part of the definition.
+    fn resolve_pending_ref_def(&mut self, line: &str, byte_offset: usize) -> bool {
+        if let Some(pending) = self.pending_ref_def.take() {
+            self.pending_ref_def_lines += 1;
+            if self.pending_ref_def_lines > REF_DEF_PENDING_MAX {
+                self.push_reference_definition(pending, String::new());
+                self.pending_ref_def_lines = 0;
+                return false;
+            }
+            if let Some(captures) = REF_DEF_CONTINUATION_RE.captures(line) {
+                let target = captures
+                    .get(1)
+                    .map(|target| target.as_str())
+                    .unwrap_or_default();
+                let target = target.trim_start_matches('<').trim_end_matches('>');
+                self.push_reference_definition(pending, target.to_string());
+                self.pending_ref_title = captures.get(2).is_none();
+                self.pending_ref_def_lines = 0;
+                return true;
+            }
+            self.push_reference_definition(pending, String::new());
+            self.pending_ref_def_lines = 0;
+            return false;
+        }
+        if self.pending_ref_title {
+            self.pending_ref_title = false;
+            if REF_DEF_TITLE_RE.is_match(line) {
+                let _ = byte_offset;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn push_reference_definition(&mut self, pending: PendingRefDef, target: String) {
+        let PendingRefDef {
+            label,
+            normalized_label,
+            label_range,
+        } = pending;
+        if !target.is_empty() {
+            self.output.analysis.links.push(MarkdownLink {
+                kind: LinkKind::Definition,
+                target: target.clone(),
+                label: Some(label.clone()),
+                range: label_range,
+                target_range: label_range,
+            });
+        }
+        self.output
+            .analysis
+            .reference_definitions
+            .push(ReferenceDefinition {
+                label,
+                normalized_label,
+                target,
+                range: label_range,
+                label_range,
+            });
     }
 
     /// Convert the pending paragraph plus the underline line just seen into
@@ -334,7 +749,7 @@ impl<'a> ScanState<'a> {
 
     // ---- Headings -------------------------------------------------------
 
-    fn scan_block_line(&mut self, line: &str, byte_offset: usize) {
+    fn scan_block_line(&mut self, line: &str, masked: &str, byte_offset: usize) {
         if let Some(captures) = HEADING_RE.captures(line) {
             let marker = captures.get(1).unwrap();
             let title_match = captures.get(2).unwrap();
@@ -368,6 +783,11 @@ impl<'a> ScanState<'a> {
 
         if let Some(captures) = FOOTNOTE_DEF_RE.captures(line) {
             let label = captures.get(1).unwrap();
+            if self.previous_was_paragraph {
+                // Definitions cannot interrupt a paragraph in pandoc; this
+                // line is a lazy paragraph continuation.
+                return;
+            }
             if self.extensions.contains(Extension::Footnotes) {
                 self.output
                     .analysis
@@ -394,39 +814,81 @@ impl<'a> ScanState<'a> {
             return;
         }
 
+        if self.previous_was_paragraph {
+            // Reference definitions cannot interrupt a paragraph in pandoc:
+            // a `[label]:` line that lazily continues a paragraph is prose
+            // (whose `[label]` may still be a shortcut reference).
+            return;
+        }
         if let Some(captures) = REF_DEF_RE.captures(line) {
             let label = captures.get(1).unwrap();
             let target = captures.get(2).unwrap();
-            if !target.as_str().is_empty() {
-                self.output.analysis.links.push(MarkdownLink {
-                    kind: LinkKind::Definition,
-                    target: target.as_str().to_string(),
-                    label: Some(label.as_str().to_string()),
-                    range: TextRange::new(byte_offset, byte_offset + line.len()),
-                    target_range: TextRange::new(
-                        byte_offset + target.start(),
-                        byte_offset + target.end(),
+            if target.as_str().is_empty() {
+                // `[label]:` with the URL on a following line (possibly after
+                // blank lines): wait for the target instead of recording an
+                // empty definition now.
+                self.pending_ref_def = Some(PendingRefDef {
+                    label: label.as_str().to_string(),
+                    normalized_label: crate::normalize_label(label.as_str()),
+                    label_range: TextRange::new(
+                        byte_offset + label.start(),
+                        byte_offset + label.end(),
                     ),
                 });
-                self.push_semantic_token(
-                    SemanticTokenKind::Link,
-                    TextRange::new(byte_offset + target.start(), byte_offset + target.end()),
-                );
+                self.pending_ref_def_lines = 0;
+                self.pending_ref_title = false;
+                return;
             }
+            if let Some(title) = captures.get(3) {
+                if REF_DEF_TITLE_RE.is_match(title.as_str()) {
+                    // `[label]: url "title"`: the title already sits on this
+                    // line, so no continuation follows.
+                    self.pending_ref_title = false;
+                }
+            }
+            let target_text = target
+                .as_str()
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string();
+            let target_text = target_text.as_str();
+            let target_offset = if target.as_str().starts_with('<') {
+                target.start() + 1
+            } else {
+                target.start()
+            };
+            self.output.analysis.links.push(MarkdownLink {
+                kind: LinkKind::Definition,
+                target: target_text.to_string(),
+                label: Some(label.as_str().to_string()),
+                range: TextRange::new(byte_offset, byte_offset + line.len()),
+                target_range: TextRange::new(
+                    byte_offset + target_offset,
+                    byte_offset + target_offset + target_text.len(),
+                ),
+            });
+            self.push_semantic_token(
+                SemanticTokenKind::Link,
+                TextRange::new(
+                    byte_offset + target_offset,
+                    byte_offset + target_offset + target_text.len(),
+                ),
+            );
             self.output
                 .analysis
                 .reference_definitions
                 .push(ReferenceDefinition {
                     label: label.as_str().to_string(),
                     normalized_label: crate::normalize_label(label.as_str()),
-                    target: target.as_str().to_string(),
+                    target: target_text.to_string(),
                     range: TextRange::new(byte_offset, byte_offset + line.len()),
                     label_range: TextRange::new(
                         byte_offset + label.start(),
                         byte_offset + label.end(),
                     ),
                 });
-            self.scan_links(line, byte_offset);
+            self.scan_links_with_carry(line, byte_offset, None, masked, masked);
         }
     }
 
@@ -457,10 +919,13 @@ impl<'a> ScanState<'a> {
                         title_start <= start && end == title_end
                     })
             {
+                // The attribute block is always consumed, even when it only
+                // carries classes or key=value pairs (`## Options {.opts}`):
+                // pandoc never includes it in the title or the identifier.
+                let attr_start = attributes.whole_range.start.saturating_sub(byte_offset);
+                let display_end = trim_ascii_whitespace_end(line, title_start, attr_start);
+                title_end = display_end;
                 if attributes.id.is_some() {
-                    let attr_start = attributes.whole_range.start.saturating_sub(byte_offset);
-                    let display_end = trim_ascii_whitespace_end(line, title_start, attr_start);
-                    title_end = display_end;
                     id = attributes.id.clone();
                     id_range = attributes.id_range;
                     source = IdentifierSource::Explicit;
@@ -476,8 +941,13 @@ impl<'a> ScanState<'a> {
         }
 
         let mut title = line[title_start..title_end].to_string();
+        // HTML comments never contribute to the heading text or identifier
+        // (`# Title <!-- omit in toc -->`), and raw inline HTML tags are
+        // dropped from identifier computation just like pandoc does.
+        strip_html_comments(&mut title);
+        let slug_text = strip_emphasis_markers(&strip_inline_html_tags(&title));
         if source == IdentifierSource::None {
-            if let Some((auto_id, algorithm)) = self.automatic_identifier(&title) {
+            if let Some((auto_id, algorithm)) = self.automatic_identifier(&slug_text) {
                 id = Some(auto_id);
                 source = algorithm;
             }
@@ -540,14 +1010,26 @@ impl<'a> ScanState<'a> {
 
     // ---- Inline constructs ----------------------------------------------
 
-    fn scan_inline_line(&mut self, line: &str, byte_offset: usize) {
-        let masked = mask_inline_code(line);
-        let is_footnote_definition = FOOTNOTE_DEF_RE.is_match(line);
-        let is_reference_definition = REF_DEF_RE.is_match(line);
+    fn scan_inline_line(
+        &mut self,
+        masked: &str,
+        raw_text: &str,
+        line: &str,
+        byte_offset: usize,
+        inline_base: usize,
+    ) {
+        // Reference definitions cannot interrupt a paragraph in pandoc: a
+        // `[label]:` line that lazily continues a paragraph is prose, and
+        // the `[label]` inside it is a (possible) shortcut reference.
+        let is_footnote_definition = FOOTNOTE_DEF_RE.is_match(line) && !self.previous_was_paragraph;
+        let is_reference_definition = REF_DEF_RE.is_match(line) && !self.previous_was_paragraph;
 
         if !is_reference_definition {
-            for captures in FULL_REF_RE.captures_iter(&masked) {
+            for captures in FULL_REF_RE.captures_iter(raw_text) {
                 let whole = captures.get(0).unwrap();
+                if inside_inline_code(masked, whole.start()) {
+                    continue;
+                }
                 let label = captures.get(2).unwrap();
                 if label.as_str().starts_with('^') {
                     continue;
@@ -555,37 +1037,43 @@ impl<'a> ScanState<'a> {
                 self.output.analysis.reference_links.push(ReferenceLink {
                     label: label.as_str().to_string(),
                     normalized_label: crate::normalize_label(label.as_str()),
-                    range: TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+                    range: TextRange::new(inline_base + whole.start(), inline_base + whole.end()),
                     label_range: TextRange::new(
-                        byte_offset + label.start(),
-                        byte_offset + label.end(),
+                        inline_base + label.start(),
+                        inline_base + label.end(),
                     ),
                 });
             }
 
-            for captures in COLLAPSED_REF_RE.captures_iter(&masked) {
+            for captures in COLLAPSED_REF_RE.captures_iter(raw_text) {
                 let whole = captures.get(0).unwrap();
+                if inside_inline_code(masked, whole.start()) {
+                    continue;
+                }
                 let label = captures.get(1).unwrap();
                 self.output.analysis.reference_links.push(ReferenceLink {
                     label: label.as_str().to_string(),
                     normalized_label: crate::normalize_label(label.as_str()),
-                    range: TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+                    range: TextRange::new(inline_base + whole.start(), inline_base + whole.end()),
                     label_range: TextRange::new(
-                        byte_offset + label.start(),
-                        byte_offset + label.end(),
+                        inline_base + label.start(),
+                        inline_base + label.end(),
                     ),
                 });
             }
 
             if self.extensions.contains(Extension::ShortcutReferenceLinks) {
-                for captures in BRACKET_SPAN_RE.captures_iter(&masked) {
+                for captures in BRACKET_SPAN_RE.captures_iter(raw_text) {
                     let whole = captures.get(0).unwrap();
+                    if inside_inline_code(masked, whole.start()) {
+                        continue;
+                    }
                     let label = captures.get(1).unwrap();
                     // Manual neighbor checks replace lookarounds (unsupported
                     // in Rust's regex crate). `[@cite]` and `^[note]` belong
                     // to other extensions; `![img]` is an image; `- [ ]` is
                     // a task list item.
-                    let prefix = masked.get(..whole.start()).unwrap_or("");
+                    let prefix = raw_text.get(..whole.start()).unwrap_or("");
                     let before_ok = prefix
                         .chars()
                         .next_back()
@@ -596,8 +1084,13 @@ impl<'a> ScanState<'a> {
                             .chars()
                             .next_back()
                             .is_some_and(|ch| matches!(ch, '-' | '*' | '+'));
-                    let after = masked.get(whole.end()..).unwrap_or("");
-                    let after_ok = !after.starts_with(['(', '[', ':', '{']);
+                    let after = raw_text.get(whole.end()..).unwrap_or("");
+                    // A following `:` does not disqualify the reference:
+                    // effective definition lines never reach this branch,
+                    // and a lazily-continued paragraph line like
+                    // `... with\n[label]:` still holds a shortcut reference
+                    // in pandoc.
+                    let after_ok = !after.starts_with(['(', '[', '{']);
                     // Citation groups like `[see @doe99]` belong to the
                     // citations extension; `[!NOTE]` to alerts; `[x]` to
                     // task lists.
@@ -614,12 +1107,12 @@ impl<'a> ScanState<'a> {
                             label: label.as_str().to_string(),
                             normalized_label: crate::normalize_label(label.as_str()),
                             range: TextRange::new(
-                                byte_offset + whole.start(),
-                                byte_offset + whole.end(),
+                                inline_base + whole.start(),
+                                inline_base + whole.end(),
                             ),
                             label_range: TextRange::new(
-                                byte_offset + label.start(),
-                                byte_offset + label.end(),
+                                inline_base + label.start(),
+                                inline_base + label.end(),
                             ),
                         });
                     }
@@ -629,12 +1122,12 @@ impl<'a> ScanState<'a> {
 
         let footnotes_on = self.extensions.contains(Extension::Footnotes);
         if !is_footnote_definition && footnotes_on {
-            for captures in FOOTNOTE_REF_RE.captures_iter(&masked) {
+            for captures in FOOTNOTE_REF_RE.captures_iter(masked) {
                 let whole = captures.get(0).unwrap();
                 let label = captures.get(1).unwrap();
                 self.push_semantic_token(
                     SemanticTokenKind::Footnote,
-                    TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+                    TextRange::new(inline_base + whole.start(), inline_base + whole.end()),
                 );
                 self.output
                     .analysis
@@ -643,19 +1136,19 @@ impl<'a> ScanState<'a> {
                         label: label.as_str().to_string(),
                         normalized_label: crate::normalize_label(label.as_str()),
                         range: TextRange::new(
-                            byte_offset + whole.start(),
-                            byte_offset + whole.end(),
+                            inline_base + whole.start(),
+                            inline_base + whole.end(),
                         ),
                         label_range: TextRange::new(
-                            byte_offset + label.start(),
-                            byte_offset + label.end(),
+                            inline_base + label.start(),
+                            inline_base + label.end(),
                         ),
                     });
             }
         } else if !is_footnote_definition && self.options.disabled_extensions {
-            for captures in FOOTNOTE_REF_RE.captures_iter(&masked) {
+            for captures in FOOTNOTE_REF_RE.captures_iter(masked) {
                 let whole = captures.get(0).unwrap();
-                let range = TextRange::new(byte_offset + whole.start(), byte_offset + whole.end());
+                let range = TextRange::new(inline_base + whole.start(), inline_base + whole.end());
                 self.push_disabled_diagnostic(
                     Extension::Footnotes,
                     range,
@@ -666,10 +1159,10 @@ impl<'a> ScanState<'a> {
         }
 
         let inline_notes_on = self.extensions.contains(Extension::InlineNotes);
-        for captures in INLINE_NOTE_RE.captures_iter(&masked) {
+        for captures in INLINE_NOTE_RE.captures_iter(masked) {
             let whole = captures.get(0).unwrap();
             let content = captures.get(1).unwrap();
-            let range = TextRange::new(byte_offset + whole.start(), byte_offset + whole.end());
+            let range = TextRange::new(inline_base + whole.start(), inline_base + whole.end());
             if inline_notes_on {
                 self.push_semantic_token(SemanticTokenKind::Footnote, range);
                 self.output.analysis.inline_notes.push(InlineNote {
@@ -686,39 +1179,54 @@ impl<'a> ScanState<'a> {
             }
         }
 
-        for captures in HEADING_LINK_RE.captures_iter(&masked) {
+        for captures in HEADING_LINK_RE.captures_iter(masked) {
             let whole = captures.get(0).unwrap();
             let anchor = captures.get(1).unwrap();
             self.output.analysis.heading_links.push(HeadingLink {
                 anchor: anchor.as_str().to_string(),
-                range: TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+                range: TextRange::new(inline_base + whole.start(), inline_base + whole.end()),
                 anchor_range: TextRange::new(
-                    byte_offset + anchor.start(),
-                    byte_offset + anchor.end(),
+                    inline_base + anchor.start(),
+                    inline_base + anchor.end(),
                 ),
             });
         }
 
         let citations_on = self.extensions.contains(Extension::Citations);
-        for captures in CITATION_RE.captures_iter(&masked) {
+        for captures in CITATION_RE.captures_iter(masked) {
             let sigil = captures.get(2).unwrap();
             let key = captures.get(3).unwrap();
-            // `(@label)` is an example-list reference, not a citation: the
-            // @-sigil is wrapped directly in parentheses.
-            let is_example_reference =
-                masked[..sigil.start()].ends_with('(') && masked[key.end()..].starts_with(')');
+            // Pandoc strips trailing punctuation (.,;:!?) from citation keys.
+            let mut key_end = key.end();
+            while key_end > key.start()
+                && matches!(
+                    key.as_str().as_bytes()[key_end - key.start() - 1],
+                    b'.' | b',' | b';' | b':' | b'!' | b'?'
+                )
+            {
+                key_end -= 1;
+            }
+            if key_end == key.start() {
+                continue;
+            }
+            let key_text = &key.as_str()[..key_end - key.start()];
+            // `(@label)` is an example-list reference, not a citation, but
+            // only for labels that an example-list marker defined.
+            let is_example_reference = masked[..sigil.start()].ends_with('(')
+                && masked[key_end..].starts_with(')')
+                && self.example_labels.contains(key_text);
             if is_example_reference {
                 continue;
             }
-            let key_range = TextRange::new(byte_offset + key.start(), byte_offset + key.end());
+            let key_range = TextRange::new(inline_base + key.start(), inline_base + key_end);
             if citations_on {
                 self.push_semantic_token(
                     SemanticTokenKind::Citation,
-                    TextRange::new(byte_offset + sigil.start(), byte_offset + key.end()),
+                    TextRange::new(inline_base + sigil.start(), inline_base + key_end),
                 );
                 self.output.analysis.citations.push(Citation {
-                    key: key.as_str().to_string(),
-                    range: TextRange::new(byte_offset + sigil.start(), byte_offset + key.end()),
+                    key: key_text.to_string(),
+                    range: TextRange::new(inline_base + sigil.start(), inline_base + key_end),
                     key_range,
                 });
             } else if self.options.disabled_extensions {
@@ -733,11 +1241,11 @@ impl<'a> ScanState<'a> {
 
         if self.extensions.contains(Extension::TexMathDollars) {
             for regex in [DISPLAY_MATH_RE.clone(), INLINE_MATH_RE.clone()] {
-                for captures in regex.captures_iter(&masked) {
+                for captures in regex.captures_iter(masked) {
                     let whole = captures.get(0).unwrap();
                     self.push_semantic_token(
                         SemanticTokenKind::Math,
-                        TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+                        TextRange::new(inline_base + whole.start(), inline_base + whole.end()),
                     );
                 }
             }
@@ -789,16 +1297,150 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    /// Inspect grid-table row cells: ATX headings inside cells become
+    /// headings (pandoc parses full block content per cell), and cells
+    /// indented four or more spaces from their border are code cells whose
+    /// text must not produce citations, notes, or links. Code and heading
+    /// cells are blanked out of `row_masked` for the inline scanners.
+    fn scan_grid_row_cells(
+        &mut self,
+        line: &str,
+        byte_offset: usize,
+        masked: &str,
+        row_masked: &mut [u8],
+    ) {
+        let mut cell_start = 0usize;
+        for (position, ch) in line.char_indices() {
+            if ch != '|' || position == 0 {
+                continue;
+            }
+            let cell = &line[cell_start + 1..position];
+            let indent = cell.len() - cell.trim_start_matches([' ', '\t']).len();
+            let _ = masked;
+            if indent >= 4 {
+                for byte in &mut row_masked[cell_start + 1..position] {
+                    *byte = b' ';
+                }
+            } else if let Some(captures) = HEADING_RE.captures(cell) {
+                let marker = captures.get(1).unwrap();
+                let title = captures.get(2).unwrap();
+                self.push_heading(
+                    cell,
+                    byte_offset + cell_start + 1,
+                    marker.as_str().len() as u8,
+                    title.start(),
+                    title.end(),
+                );
+                for byte in &mut row_masked[cell_start + 1..position] {
+                    *byte = b' ';
+                }
+            }
+            cell_start = position;
+        }
+    }
+
     // ---- Links -----------------------------------------------------------
 
-    fn scan_links(&mut self, line: &str, byte_offset: usize) {
-        let masked = mask_inline_code(line);
+    fn scan_links_with_carry(
+        &mut self,
+        line: &str,
+        byte_offset: usize,
+        carried: Option<(usize, String, String)>,
+        masked: &str,
+        raw_line: &str,
+    ) {
+        // Inline links, possibly with link text carried over from the
+        // previous line (`[User's\nGuide](url)` is one link in pandoc).
+        let virtual_text;
+        let virtual_raw;
+        let scan_base;
+        match &carried {
+            Some((carry_offset, carry_strict, carry_raw)) => {
+                // Pandoc turns the wrapped newline into a space.
+                let joiner = if carry_strict.ends_with(' ') { "" } else { " " };
+                virtual_text = format!("{carry_strict}{joiner}{masked}");
+                virtual_raw = format!("{carry_raw}{joiner}{raw_line}");
+                scan_base = *carry_offset;
+            }
+            None => {
+                virtual_text = masked.to_string();
+                virtual_raw = raw_line.to_string();
+                scan_base = byte_offset;
+            }
+        }
+        let mut matched = Vec::new();
+        self.scan_inline_links(&virtual_text, scan_base, &mut matched);
 
-        for captures in INLINE_LINK_RE.captures_iter(&masked) {
+        for captures in AUTOLINK_RE.captures_iter(masked) {
+            let whole = captures.get(0).unwrap();
+            let url = captures.get(1).unwrap();
+            self.output.analysis.links.push(MarkdownLink {
+                kind: LinkKind::Autolink,
+                target: url.as_str().to_string(),
+                label: Some(url.as_str().to_string()),
+                range: TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+                target_range: TextRange::new(byte_offset + url.start(), byte_offset + url.end()),
+            });
+        }
+
+        // Email autolinks `<user@example.com>` resolve to mailto: targets.
+        for captures in EMAIL_AUTOLINK_RE.captures_iter(masked) {
+            let whole = captures.get(0).unwrap();
+            let address = captures.get(1).unwrap();
+            self.output.analysis.links.push(MarkdownLink {
+                kind: LinkKind::Autolink,
+                target: format!("mailto:{}", address.as_str()),
+                label: Some(address.as_str().to_string()),
+                range: TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+                target_range: TextRange::new(
+                    byte_offset + address.start(),
+                    byte_offset + address.end(),
+                ),
+            });
+        }
+
+        // Remember an unclosed `[` so that a link opening on this line can
+        // close on the next one. Already-matched spans are blanked out so
+        // the carry never re-finds the same link on a later line.
+        let mut carry_text = virtual_text.into_bytes();
+        for (start, end) in matched {
+            let start = start.min(carry_text.len());
+            let end = end.min(carry_text.len());
+            for byte in &mut carry_text[start..end] {
+                *byte = b' ';
+            }
+        }
+        let carry_text = String::from_utf8(carry_text).expect("carry text is valid UTF-8");
+        if let Some((offset, text)) = unclosed_bracket(&carry_text) {
+            if offset + text.len() <= LINK_CARRY_MAX {
+                // The raw variant of the same region: same offsets in the
+                // equally long raw text.
+                let raw_slice = virtual_raw
+                    .get(offset..offset + text.len())
+                    .unwrap_or(text.as_str())
+                    .to_string();
+                self.link_carry = Some((scan_base + offset, text, raw_slice));
+            }
+        }
+        let _ = line;
+    }
+
+    /// Find inline `[text](target)` links (and images) in `masked` text
+    /// whose byte 0 corresponds to absolute offset `base`. Nested images
+    /// inside link text (`[![alt](src)](target)`) are recorded too, like
+    /// pandoc's AST does.
+    fn scan_inline_links(&mut self, masked: &str, base: usize, matched: &mut Vec<(usize, usize)>) {
+        for captures in INLINE_LINK_RE.captures_iter(masked) {
             let whole = captures.get(0).unwrap();
             let bang = captures.get(1).unwrap();
+            let text = captures.get(2).unwrap();
             let url = captures.get(3).unwrap();
-            let target = url.as_str().trim_matches(|ch| ch == '<' || ch == '>');
+            let target = url
+                .as_str()
+                .trim()
+                .trim_matches(|ch| ch == '<' || ch == '>')
+                .replace("\\(", "(")
+                .replace("\\)", ")");
             let kind = if bang.as_str().is_empty() {
                 LinkKind::Inline
             } else {
@@ -812,29 +1454,19 @@ impl<'a> ScanState<'a> {
             self.output.analysis.links.push(MarkdownLink {
                 kind,
                 target: target.to_string(),
-                label: captures.get(2).map(|label| label.as_str().to_string()),
-                range: TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
-                target_range: TextRange::new(
-                    byte_offset + url_offset,
-                    byte_offset + url_offset + target.len(),
-                ),
+                label: Some(text.as_str().to_string()),
+                range: TextRange::new(base + whole.start(), base + whole.end()),
+                target_range: TextRange::new(base + url_offset, base + url_offset + target.len()),
             });
             self.push_semantic_token(
                 SemanticTokenKind::Link,
-                TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
+                TextRange::new(base + whole.start(), base + whole.end()),
             );
-        }
-
-        for captures in AUTOLINK_RE.captures_iter(&masked) {
-            let whole = captures.get(0).unwrap();
-            let url = captures.get(1).unwrap();
-            self.output.analysis.links.push(MarkdownLink {
-                kind: LinkKind::Autolink,
-                target: url.as_str().to_string(),
-                label: Some(url.as_str().to_string()),
-                range: TextRange::new(byte_offset + whole.start(), byte_offset + whole.end()),
-                target_range: TextRange::new(byte_offset + url.start(), byte_offset + url.end()),
-            });
+            matched.push((whole.start(), whole.end()));
+            if kind == LinkKind::Inline && text.as_str().contains("![") {
+                let text_base = base + whole.start() + bang.as_str().len() + 1;
+                self.scan_inline_links(text.as_str(), text_base, matched);
+            }
         }
     }
 
@@ -962,11 +1594,10 @@ impl<'a> ScanState<'a> {
 
     // ---- Disabled extension usage ---------------------------------------
 
-    fn scan_disabled_inline(&mut self, line: &str, byte_offset: usize) {
+    fn scan_disabled_inline(&mut self, line: &str, masked: &str, byte_offset: usize) {
         if !self.options.disabled_extensions {
             return;
         }
-        let masked = mask_inline_code(line);
 
         macro_rules! when_disabled {
             ($extension:expr, $severity:expr, $regex:expr, $message:expr) => {
@@ -999,7 +1630,7 @@ impl<'a> ScanState<'a> {
         // Mark: `==text==`. Skip runs that are part of table borders
         // (`+=====+`) or that touch other `=`/`+` characters.
         if !self.extensions.contains(Extension::Mark) {
-            for captures in MARK_RE.captures_iter(&masked) {
+            for captures in MARK_RE.captures_iter(masked) {
                 let whole = captures.get(0).unwrap();
                 let before = &masked[..whole.start()];
                 let after = &masked[whole.end()..];
@@ -1022,7 +1653,7 @@ impl<'a> ScanState<'a> {
         );
         // Emoji shortcodes: standalone ":name:" only, not "12:30:45".
         if !self.extensions.contains(Extension::Emoji) {
-            for captures in EMOJI_RE.captures_iter(&masked) {
+            for captures in EMOJI_RE.captures_iter(masked) {
                 let whole = captures.get(0).unwrap();
                 // Standalone `:name:` shortcodes only: neighbors must not be
                 // alphanumeric (times like 12:30) nor table/path delimiters
@@ -1071,7 +1702,7 @@ impl<'a> ScanState<'a> {
 
         // Subscript: skip runs that are part of ~~ (strikeout markers).
         if !self.extensions.contains(Extension::Subscript) {
-            for captures in SUBSCRIPT_RE.captures_iter(&masked) {
+            for captures in SUBSCRIPT_RE.captures_iter(masked) {
                 let whole = captures.get(0).unwrap();
                 let before = &masked[..whole.start()];
                 let after = &masked[whole.end()..];
@@ -1090,7 +1721,7 @@ impl<'a> ScanState<'a> {
         // Inline math with single dollars: only flag tight, math-looking
         // spans to avoid flagging currency like "$5 and $6".
         if !self.extensions.contains(Extension::TexMathDollars) {
-            for captures in INLINE_MATH_RE.captures_iter(&masked) {
+            for captures in INLINE_MATH_RE.captures_iter(masked) {
                 let whole = captures.get(0).unwrap();
                 let content = captures.get(1).unwrap().as_str();
                 let mathish = if content.contains(' ') {
@@ -1118,7 +1749,7 @@ impl<'a> ScanState<'a> {
         if !self.extensions.contains(Extension::TexMathSingleBackslash)
             && !self.extensions.contains(Extension::TexMathDoubleBackslash)
         {
-            for captures in MATH_BACKSLASH_RE.captures_iter(&masked) {
+            for captures in MATH_BACKSLASH_RE.captures_iter(masked) {
                 let whole = captures.get(0).unwrap();
                 self.push_disabled_diagnostic(
                     Extension::TexMathSingleBackslash,
@@ -1236,10 +1867,19 @@ impl<'a> ScanState<'a> {
 
 /// Detect a fenced code block marker line (``` or ~~~ with length >= 3).
 fn fence_marker(line: &str) -> Option<(char, usize)> {
-    let trimmed = line.trim_start_matches([' ', '\t']);
-    if line.len() - trimmed.len() > 3 {
-        return None;
-    }
+    // Fences may be indented to align with list content, and may sit inside
+    // a block quote; indented-code handling in `line()` already keeps
+    // top-level indented fences out of reach.
+    let after_indent = line.trim_start_matches([' ', '\t']);
+    let quote_len = usize::from(after_indent.starts_with('>'));
+    let trimmed = if quote_len == 1 {
+        after_indent
+            .strip_prefix('>')
+            .unwrap()
+            .trim_start_matches([' ', '\t'])
+    } else {
+        after_indent
+    };
     let delimiter = trimmed.chars().next()?;
     if !matches!(delimiter, '`' | '~') {
         return None;
@@ -1248,15 +1888,347 @@ fn fence_marker(line: &str) -> Option<(char, usize)> {
     (length >= 3).then_some((delimiter, length))
 }
 
-/// Replace inline code spans (`...`, ``...``) with spaces so that inline
-/// regexes do not match inside them. Byte length is preserved.
-fn mask_inline_code(line: &str) -> String {
-    if !line.contains('`') {
+/// Block-quote depth and the visual column of the first character that is
+/// neither whitespace nor part of the leading `>` prefixes (tabs count as
+/// four columns, each `>` as two).
+fn line_geometry(line: &str) -> (usize, usize) {
+    let mut column = 0usize;
+    let mut quotes = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        match ch {
+            ' ' => column += 1,
+            '\t' => column = (column / 4 + 1) * 4,
+            '>' if column <= 3 => {
+                quotes += 1;
+                column += 2;
+            }
+            _ => break,
+        }
+        chars.next();
+    }
+    (quotes, column)
+}
+
+/// Content column of a definition-list definition marker line
+/// (`: definition`, `:: definition`, `~ definition`), if this is one.
+fn definition_list_content_column(line: &str) -> Option<usize> {
+    if !DEF_LIST_MARKER_RE.is_match(line) {
+        return None;
+    }
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let after_marker = trimmed.trim_start_matches([':', '~']);
+    let marker_len = trimmed.len() - after_marker.len();
+    let spaces = after_marker.len() - after_marker.trim_start_matches([' ', '\t']).len();
+    let indent = line.len() - trimmed.len();
+    Some(indent + marker_len + spaces)
+}
+
+/// Content column of a bullet or ordered list item line, if this is one.
+fn list_content_column(line: &str) -> Option<usize> {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let indent = line.len() - trimmed.len();
+    if indent > 3 {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let marker_len = if matches!(bytes.first(), Some(b'-') | Some(b'*') | Some(b'+'))
+        && bytes.get(1).is_some_and(|b| *b == b' ' || *b == b'\t')
+    {
+        2
+    } else if bytes.first().is_some_and(|b| b.is_ascii_digit())
+        && trimmed.find(['.', ')']).is_some_and(|position| {
+            trimmed[..position].chars().all(|ch| ch.is_ascii_digit())
+                && bytes
+                    .get(position + 1)
+                    .is_some_and(|b| *b == b' ' || *b == b'\t')
+        })
+    {
+        trimmed.find(['.', ')']).map(|position| position + 2)?
+    } else {
+        return None;
+    };
+    let after_marker = &trimmed[marker_len..];
+    let spaces = after_marker.len() - after_marker.trim_start_matches([' ', '\t']).len();
+    Some(indent + marker_len + spaces)
+}
+
+/// Remove `<!-- ... -->` comments from a heading title in place.
+fn strip_html_comments(title: &mut String) {
+    if !title.contains("<!--") {
+        return;
+    }
+    let mut cleaned = String::with_capacity(title.len());
+    let mut rest = title.as_str();
+    while let Some(start) = rest.find("<!--") {
+        cleaned.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + 3..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    cleaned.push_str(rest);
+    *title = cleaned;
+}
+
+/// Drop emphasis markers (`**bold**`, `_italic_`) from the text used for
+/// identifier computation: pandoc computes identifiers from the plain text
+/// of the heading inlines, where formatting markers do not exist.
+fn strip_emphasis_markers(title: &str) -> String {
+    if !title.contains('*') && !title.contains('_') {
+        return title.to_string();
+    }
+    let mut cleaned = title.replace('*', "");
+    // `_word_` emphasis pairs (not snake_case identifiers, which never wrap
+    // a whole word in single underscores with word boundaries around them).
+    let emphasis = regex::Regex::new(r"(^|[^[:alnum:]_])_([^_\s]+)_([^[:alnum:]_]|$)").unwrap();
+    let mut previous = cleaned.clone();
+    loop {
+        let next = emphasis.replace_all(&previous, "${1}${2}${3}").to_string();
+        if next == previous {
+            break;
+        }
+        previous = next;
+    }
+    cleaned = previous;
+    cleaned
+}
+
+/// Drop inline HTML tags (`<b>`, `</em>`, `<br/>`) from the text used for
+/// identifier computation, mirroring pandoc, which excludes RawInline
+/// elements from identifiers.
+fn strip_inline_html_tags(title: &str) -> String {
+    if !title.contains('<') {
+        return title.to_string();
+    }
+    let mut cleaned = String::with_capacity(title.len());
+    let mut rest = title;
+    while let Some(start) = rest.find('<') {
+        cleaned.push_str(&rest[..start]);
+        match rest[start..].find('>') {
+            Some(end) => rest = &rest[start + end + 1..],
+            None => break,
+        }
+    }
+    cleaned.push_str(rest);
+    cleaned
+}
+
+/// A grid-table rule line (`+---+---+`, `+===+===+`).
+static GRID_RULE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[ \t]{0,3}\+[-+=]+\+$").unwrap());
+
+/// The label of an example-list marker line (`(@label) text`), if this is
+/// one.
+fn example_list_label(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("(@")?;
+    let close = rest.find(')')?;
+    let after = &rest[close + 1..];
+    if !after.starts_with([' ', '\t']) {
+        return None;
+    }
+    Some(rest[..close].to_string())
+}
+
+/// Position of the `(` of a `](` whose parentheses never close on this
+/// line (a wrapped inline-link destination).
+fn unclosed_link_paren(masked: &str) -> Option<usize> {
+    let bytes = masked.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b']' && bytes[index + 1] == b'(' {
+            let mut depth = 0i32;
+            let mut scan = index + 1;
+            let mut closed = false;
+            while scan < bytes.len() {
+                match bytes[scan] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            closed = true;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                scan += 1;
+            }
+            if !closed {
+                return Some(index + 1);
+            }
+            index = scan;
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+/// Whether the byte at `position` in the raw line was masked as inline code.
+fn inside_inline_code(masked: &str, position: usize) -> bool {
+    masked
+        .as_bytes()
+        .get(position)
+        .is_some_and(|byte| *byte == b' ')
+        && position < masked.len()
+}
+
+/// If the masked text ends inside an unclosed `[`, return the offset and
+/// text of the leftmost unclosed opening bracket (excluding footnote
+/// brackets `[^`). Used to carry link text across line wraps.
+fn unclosed_bracket(masked: &str) -> Option<(usize, String)> {
+    let mut stack = Vec::new();
+    for (index, ch) in masked.char_indices() {
+        match ch {
+            '[' => stack.push(index),
+            ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    if stack.is_empty() {
+        // No unclosed bracket, but an inline link destination may wrap:
+        // `[foo](/bar` continues on the next line. Carry the whole construct
+        // from its link-text bracket.
+        if let Some(open_paren) = unclosed_link_paren(masked) {
+            let close = masked[..open_paren].rfind(']')?;
+            let mut depth = 0i32;
+            let mut start = None;
+            for (index, ch) in masked[..close].char_indices().rev() {
+                match ch {
+                    ']' => depth += 1,
+                    '[' => {
+                        depth -= 1;
+                        if depth < 0 {
+                            start = Some(index);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let start = start?;
+            if masked[start..].starts_with("[^") {
+                return None;
+            }
+            return Some((start, masked[start..].to_string()));
+        }
+        return None;
+    }
+    let mut start = *stack.first()?;
+    if masked[start..].starts_with("[^") {
+        return None;
+    }
+    if start > 0 && masked.as_bytes().get(start - 1) == Some(&b']') {
+        let mut depth = 0i32;
+        for (index, ch) in masked[..start].char_indices().rev() {
+            match ch {
+                ']' => depth += 1,
+                '[' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        start = index;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Some((start, masked[start..].to_string()))
+}
+
+/// Mask inline code spans, carrying an unclosed backtick run from the
+/// previous line (inline code may wrap across lines, like pandoc's).
+fn mask_inline_code_with_carry(
+    line: &str,
+    code_carry: Option<usize>,
+    next_carry: &mut Option<usize>,
+) -> String {
+    if code_carry.is_none() && !line.contains('`') {
         return line.to_string();
     }
+    let masked = mask_inline_code(line);
+    if let Some(run) = code_carry {
+        // Find the closing run of the same length anywhere in this line and
+        // blank everything up to and including it.
+        let mut scan = 0usize;
+        let bytes = masked.as_bytes().to_vec();
+        while scan < bytes.len() {
+            if bytes[scan] == b'`' {
+                let mut length = 0;
+                while scan + length < bytes.len() && bytes[scan + length] == b'`' {
+                    length += 1;
+                }
+                if length >= run {
+                    let mut blanked = masked.into_bytes();
+                    for byte in &mut blanked[..scan + length] {
+                        *byte = b' ';
+                    }
+                    *next_carry = None;
+                    return String::from_utf8(blanked).expect("mask is valid UTF-8");
+                }
+                scan += length;
+            } else {
+                scan += 1;
+            }
+        }
+        // Still unclosed: blank the whole line and keep carrying.
+        *next_carry = Some(run);
+        return " ".repeat(line.len());
+    }
+    // Compute a fresh carry: the first backtick run still standing after
+    // same-line pairing opens a code span that continues onto following
+    // lines, so everything from it to the end of this line is masked too.
+    if let Some((position, run)) = first_unmatched_backtick_run(&masked) {
+        let mut blanked = masked.into_bytes();
+        for byte in &mut blanked[position..] {
+            *byte = b' ';
+        }
+        *next_carry = Some(run);
+        return String::from_utf8(blanked).expect("mask is valid UTF-8");
+    }
+    *next_carry = None;
+    masked
+}
 
+/// Position and length of the first backtick run (1 or 2 backticks) in the
+/// masked line; mask_inline_code blanked all closed pairs, so a remaining
+/// run opens a span that continues on a following line.
+fn first_unmatched_backtick_run(masked: &str) -> Option<(usize, usize)> {
+    let bytes = masked.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'`' {
+            let mut length = 0;
+            while index + length < bytes.len() && bytes[index + length] == b'`' {
+                length += 1;
+            }
+            if (1..=2).contains(&length) {
+                return Some((index, length));
+            }
+            index += length;
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+/// Byte extents (start, end) of same-line closed inline code spans with
+/// one or two backticks.
+fn code_span_extents(line: &str) -> Vec<(usize, usize)> {
+    let mut extents = Vec::new();
+    if !line.contains('`') {
+        return extents;
+    }
     let bytes = line.as_bytes();
-    let mut masked = bytes.to_vec();
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'`' {
@@ -1289,19 +2261,31 @@ fn mask_inline_code(line: &str) -> String {
                 }
             }
             if let Some(close) = close {
-                for byte in &mut masked[run_start..close + run_len] {
-                    if *byte != b' ' {
-                        *byte = b' ';
-                    }
-                }
+                extents.push((run_start, close + run_len));
                 index = close + run_len;
             }
         } else {
             index += 1;
         }
     }
+    extents
+}
 
-    // Only backtick bytes were replaced with spaces, so this is valid UTF-8.
+/// Replace inline code spans (`...`, ``...``) with spaces so that inline
+/// regexes do not match inside them. Byte length is preserved.
+fn mask_inline_code(line: &str) -> String {
+    let extents = code_span_extents(line);
+    if extents.is_empty() {
+        return line.to_string();
+    }
+    let mut masked = line.as_bytes().to_vec();
+    for (start, end) in extents {
+        for byte in &mut masked[start..end] {
+            if *byte != b' ' {
+                *byte = b' ';
+            }
+        }
+    }
     String::from_utf8(masked).expect("masked line is valid UTF-8")
 }
 

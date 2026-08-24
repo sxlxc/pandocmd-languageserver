@@ -14,6 +14,10 @@ rustc-ice-*.txt
 .DS_Store
 *.log
 
+# Corpus files are fetched at test time from pinned upstream URLs and are
+# not redistributed from this repository (see tests/corpus/README.md).
+crates/pandocmd-analysis/tests/corpus/cache/
+
 # The parser source is intentionally vendored because Cargo cannot consume the
 # upstream repository directly while its submodule URL is malformed.
 !/vendor/
